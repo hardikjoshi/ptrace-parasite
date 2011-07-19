@@ -68,6 +68,8 @@ static int seize_process(pid_t pid)
 	return 0;
 }
 
+extern char parasite_blob[];
+extern int parasite_blob_size;
 extern char insertion_blob[];
 extern int insertion_blob_size;
 

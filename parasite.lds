@@ -12,5 +12,6 @@ SECTIONS
 		*(.data)
 		*(.rodata)
 		*(.bss)
+		. = ALIGN(4096);
 	}
 }
