@@ -73,19 +73,19 @@ extern int insertion_blob_size;
 
 static void __attribute__((used)) insertion_blob_container(void)
 {
-	asm __volatile__(".globl insertion_blob		\n\t"
-			 "insertion_blob:		\n\t"
-			 "movq $1, %rax			\n\t"
-			 "movq $1, %rdi			\n\t"
-			 "1:leaq 1f(%rip), %rsi		\n\t"
-			 "movq $14, %rdx		\n\t"
-			 "syscall			\n\t"
-			 "int $0x03			\n\t"
-			 "1: .ascii \"hello, world!\\n\"\n\t"
-			 "2:				\n\t"
-			 ".globl insertion_blob_size	\n\t"
-			 "insertion_blob_size:		\n\t"
-			 ".int 2b - insertion_blob	\n\t");
+	asm volatile(".globl insertion_blob		\n\t"
+		     "insertion_blob:			\n\t"
+		     "movq $1, %rax			\n\t"
+		     "movq $1, %rdi			\n\t"
+		     "1:leaq 1f(%rip), %rsi		\n\t"
+		     "movq $14, %rdx			\n\t"
+		     "syscall				\n\t"
+		     "int $0x03				\n\t"
+		     "1: .ascii \"hello, world!\\n\"	\n\t"
+		     "2:				\n\t"
+		     ".globl insertion_blob_size	\n\t"
+		     "insertion_blob_size:		\n\t"
+		     ".int 2b - insertion_blob		\n\t");
 }
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
