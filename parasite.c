@@ -70,8 +70,8 @@ static int seize_process(pid_t pid)
 
 static void insert_parasite(pid_t tid)
 {
-	/* int $0x80; int $0x03; "hello, world!\n" */
-	const char cmd[24] = "\xcd\x80\xcd\x03hello, world!\n";
+	/* syscall; int $0x03; "hello, world!\n" */
+	const char cmd[24] = "\x0f\x05\xcd\x03hello, world!\n";
 	unsigned long buf[sizeof(cmd) / sizeof(unsigned long)];
 	struct user_regs_struct orig_uregs, uregs;
 	sigset_t orig_sigset, sigset;
@@ -97,7 +97,7 @@ static void insert_parasite(pid_t tid)
 	 * if was in syscall, should restore w/ syscall. otherwise w/ intr.
 	 * investigate the kernel exit code.
 	 */
-	uregs.orig_rax = 0;
+	uregs.orig_rax = -1;
 	uregs.rax = 1;				/* __NR_write */
 	uregs.rdi = 1;				/* stdout */
 	uregs.rsi = (unsigned long)pc + 4;	/* "hello, world!\n" */
@@ -105,20 +105,12 @@ static void insert_parasite(pid_t tid)
 	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &uregs));
 
 	assert(!ptrace(PTRACE_CONT, tid, NULL, NULL));
-	printf("XXX0\n");
 	assert(wait4(tid, &status, __WALL, NULL) == tid);
 	assert(WIFSTOPPED(status));
 	assert(!ptrace(PTRACE_INTERRUPT, tid, NULL, NULL));
 	assert(!ptrace(PTRACE_CONT, tid, NULL, NULL));
-	printf("XXX1\n");
 	assert(wait4(tid, &status, __WALL, NULL) == tid);
 	assert(WIFSTOPPED(status));
-
-	{
-		assert(!ptrace(PTRACE_GETREGS, tid, NULL, &uregs));
-		printf("XXX rax=%#lx orig_rax=%#lx rdi=%#lx rsi=%#lx rdx=%#lx\n",
-		       uregs.rax, uregs.orig_rax, uregs.rdi, uregs.rsi, uregs.rdx);
-	}
 
 	for (i = 0; i < sizeof(buf) / sizeof(buf[0]); i++)
 		assert(!ptrace(PTRACE_POKEDATA, tid, pc + i, (void *)buf[i]));
