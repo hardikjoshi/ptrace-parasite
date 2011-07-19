@@ -88,6 +88,8 @@ static void __attribute__((used)) insertion_blob_container(void)
 			 ".int 2b - insertion_blob	\n\t");
 }
 
+#define __round_mask(x, y) ((__typeof__(x))((y)-1))
+#define round_down(x, y) ((x) & ~__round_mask(x, y))
 #define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
 
 static void insert_parasite(pid_t tid)
@@ -111,7 +113,7 @@ static void insert_parasite(pid_t tid)
 	assert(!ptrace(PTRACE_SETSIGMASK, tid, NULL, &sigset));
 
 	uregs = orig_uregs;
-	pc = (void *)uregs.rip;
+	pc = (void *)round_down(uregs.rip, 4096);
 
 	for (i = 0; i < len; i++) {
 		buf[i] = ptrace(PTRACE_PEEKDATA, tid, pc + i, NULL);
@@ -120,6 +122,7 @@ static void insert_parasite(pid_t tid)
 	}
 
 	uregs.orig_rax = -1;
+	uregs.rip = (unsigned long)pc;
 	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &uregs));
 
 	assert(!ptrace(PTRACE_CONT, tid, NULL, NULL));
