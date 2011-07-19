@@ -68,19 +68,38 @@ static int seize_process(pid_t pid)
 	return 0;
 }
 
-extern const void *parasite_blob;
-extern const size_t parasite_blob_size;
+extern char insertion_blob[];
+extern int insertion_blob_size;
+
+static void __attribute__((used)) insertion_blob_container(void)
+{
+	asm __volatile__(".globl insertion_blob		\n\t"
+			 "insertion_blob:		\n\t"
+			 "movq $1, %rax			\n\t"
+			 "movq $1, %rdi			\n\t"
+			 "1:leaq 1f(%rip), %rsi		\n\t"
+			 "movq $14, %rdx		\n\t"
+			 "syscall			\n\t"
+			 "int $0x03			\n\t"
+			 "1: .ascii \"hello, world!\\n\"\n\t"
+			 "2:				\n\t"
+			 ".globl insertion_blob_size	\n\t"
+			 "insertion_blob_size:		\n\t"
+			 ".int 2b - insertion_blob	\n\t");
+}
 
 #define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
 
 static void insert_parasite(pid_t tid)
 {
-	size_t len = DIV_ROUND_UP(parasite_blob_size, sizeof(unsigned long));
+	size_t len = DIV_ROUND_UP(insertion_blob_size, sizeof(unsigned long));
 	unsigned long *buf;
 	struct user_regs_struct orig_uregs, uregs;
 	sigset_t orig_sigset, sigset;
 	unsigned long *pc;
 	int i, status;
+
+	printf("insertion_blob_size=%d\n", insertion_blob_size);
 
 	buf = malloc(sizeof(buf[0]) * len);
 	assert(buf);
@@ -97,18 +116,10 @@ static void insert_parasite(pid_t tid)
 	for (i = 0; i < len; i++) {
 		buf[i] = ptrace(PTRACE_PEEKDATA, tid, pc + i, NULL);
 		assert(!ptrace(PTRACE_POKEDATA, tid, pc + i,
-			       (void *)*((unsigned long *)parasite_blob + i)));
+			       (void *)*((unsigned long *)insertion_blob + i)));
 	}
 
-	/*
-	 * if was in syscall, should restore w/ syscall. otherwise w/ intr.
-	 * investigate the kernel exit code.
-	 */
 	uregs.orig_rax = -1;
-	uregs.rax = 1;				/* __NR_write */
-	uregs.rdi = 1;				/* stdout */
-	uregs.rsi = (unsigned long)pc + 4;	/* "hello, world!\n" */
-	uregs.rdx = 14;				/* string len */
 	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &uregs));
 
 	assert(!ptrace(PTRACE_CONT, tid, NULL, NULL));
