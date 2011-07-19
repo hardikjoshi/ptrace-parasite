@@ -68,15 +68,22 @@ static int seize_process(pid_t pid)
 	return 0;
 }
 
+extern const void *parasite_blob;
+extern const size_t parasite_blob_size;
+
+#define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
+
 static void insert_parasite(pid_t tid)
 {
-	/* syscall; int $0x03; "hello, world!\n" */
-	const char cmd[24] = "\x0f\x05\xcd\x03hello, world!\n";
-	unsigned long buf[sizeof(cmd) / sizeof(unsigned long)];
+	size_t len = DIV_ROUND_UP(parasite_blob_size, sizeof(unsigned long));
+	unsigned long *buf;
 	struct user_regs_struct orig_uregs, uregs;
 	sigset_t orig_sigset, sigset;
 	unsigned long *pc;
 	int i, status;
+
+	buf = malloc(sizeof(buf[0]) * len);
+	assert(buf);
 
 	assert(!ptrace(PTRACE_GETREGS, tid, NULL, &orig_uregs));
 	assert(!ptrace(PTRACE_GETSIGMASK, tid, NULL, &orig_sigset));
@@ -87,10 +94,10 @@ static void insert_parasite(pid_t tid)
 	uregs = orig_uregs;
 	pc = (void *)uregs.rip;
 
-	for (i = 0; i < sizeof(buf) / sizeof(buf[0]); i++) {
+	for (i = 0; i < len; i++) {
 		buf[i] = ptrace(PTRACE_PEEKDATA, tid, pc + i, NULL);
 		assert(!ptrace(PTRACE_POKEDATA, tid, pc + i,
-			       (void *)*((unsigned long *)cmd + i)));
+			       (void *)*((unsigned long *)parasite_blob + i)));
 	}
 
 	/*
@@ -112,11 +119,13 @@ static void insert_parasite(pid_t tid)
 	assert(wait4(tid, &status, __WALL, NULL) == tid);
 	assert(WIFSTOPPED(status));
 
-	for (i = 0; i < sizeof(buf) / sizeof(buf[0]); i++)
+	for (i = 0; i < len; i++)
 		assert(!ptrace(PTRACE_POKEDATA, tid, pc + i, (void *)buf[i]));
 
 	assert(!ptrace(PTRACE_SETSIGMASK, tid, NULL, &orig_sigset));
 	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &orig_uregs));
+
+	free(buf);
 }
 
 int main(int argc, char **argv)
