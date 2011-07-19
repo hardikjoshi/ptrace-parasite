@@ -35,7 +35,7 @@ static long sys_exit(int error_code)
 
 static void __attribute__((used)) parasite(void)
 {
-	static const char str[] = "hello world!\n";
+	static const char str[] = "parasite: hello, world!\n";
 
 	sys_write(1, str, sizeof(str));
 	sys_exit(0);
@@ -44,8 +44,8 @@ static void __attribute__((used)) parasite(void)
 static void __attribute__((used)) parasite_entry_container(void)
 {
 	asm volatile(".pushsection .entry.text, \"ax\"			\n\t"
-		     "movq stack_area + "__stringify(STACK_SIZE)"(%rip), %rsp\n\t"
-		     "pushq 0						\n\t"
+		     "leaq stack_area + "__stringify(STACK_SIZE)"(%rip), %rsp\n\t"
+		     "pushq $0						\n\t"
 		     "movq %rsp, %rbp					\n\t"
 		     "call parasite					\n\t"
 		     "int $0x03						\n\t"
