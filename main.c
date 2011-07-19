@@ -30,6 +30,23 @@
 static pid_t tids[MAX_THREADS];
 static int nr_threads;
 
+#define __round_mask(x, y) ((__typeof__(x))((y)-1))
+#define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
+#define round_down(x, y) ((x) & ~__round_mask(x, y))
+#define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
+
+#define min(x, y) ({				\
+	typeof(x) _min1 = (x);			\
+	typeof(y) _min2 = (y);			\
+	(void) (&_min1 == &_min2);		\
+	_min1 < _min2 ? _min1 : _min2; })
+
+#define max(x, y) ({				\
+	typeof(x) _max1 = (x);			\
+	typeof(y) _max2 = (y);			\
+	(void) (&_max1 == &_max2);		\
+	_max1 > _max2 ? _max1 : _max2; })
+
 static int seize_process(pid_t pid)
 {
 	char path[PATH_MAX];
@@ -137,50 +154,20 @@ static void __attribute__((used)) insertion_blob_container(void)
 		     :: "i" (sizeof(parasite_blob)));
 }
 
-#define __round_mask(x, y) ((__typeof__(x))((y)-1))
-#define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
-#define round_down(x, y) ((x) & ~__round_mask(x, y))
-#define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
-
-struct host_ctx {
-	unsigned long *pc;
-	unsigned long count;
-	unsigned long code[];
-};
-
-static struct host_ctx *prepare_host(pid_t tid, const char *blob, size_t size,
-				     unsigned long r15)
+static unsigned long execute_blob(pid_t tid, struct user_regs_struct uregs,
+				  unsigned long *pc, const char *blob,
+				  size_t size, unsigned long r15)
 {
-	struct user_regs_struct uregs;
-	struct host_ctx *ctx;
-	int i;
+	int i, status;
 
-	ctx = malloc(sizeof(*ctx) + round_up(size, sizeof(unsigned long)));
-	assert(ctx);
-
-	ctx->count = DIV_ROUND_UP(size, sizeof(unsigned long));
-
-	assert(!ptrace(PTRACE_GETREGS, tid, NULL, &uregs));
-	ctx->pc = (void *)round_down(uregs.rip, 4096);
-
-	for (i = 0; i < ctx->count; i++) {
-		ctx->code[i] = ptrace(PTRACE_PEEKDATA, tid, ctx->pc + i, NULL);
-		assert(!ptrace(PTRACE_POKEDATA, tid, ctx->pc + i,
+	for (i = 0; i < DIV_ROUND_UP(size, sizeof(unsigned long)); i++)
+		assert(!ptrace(PTRACE_POKEDATA, tid, pc + i,
 			       (void *)*((unsigned long *)blob + i)));
-	}
 
 	uregs.orig_rax = -1;
-	uregs.rip = (unsigned long)ctx->pc;
+	uregs.rip = (unsigned long)pc;
 	uregs.r15 = r15;
 	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &uregs));
-
-	return ctx;
-}
-
-static unsigned long execute_blob(pid_t tid)
-{
-	struct user_regs_struct uregs;
-	int status;
 
 	assert(!ptrace(PTRACE_CONT, tid, NULL, NULL));
 	assert(wait4(tid, &status, __WALL, NULL) == tid);
@@ -194,21 +181,11 @@ static unsigned long execute_blob(pid_t tid)
 	return uregs.rax;
 }
 
-static void release_host(pid_t tid, struct host_ctx *ctx)
-{
-	int i;
-
-	for (i = 0; i < ctx->count; i++)
-		assert(!ptrace(PTRACE_POKEDATA, tid, ctx->pc + i,
-			       (void *)ctx->code[i]));
-	free(ctx);
-}
-
 static void insert_parasite(pid_t tid)
 {
 	struct user_regs_struct orig_uregs;
 	sigset_t orig_sigset, sigset;
-	struct host_ctx *ctx;
+	unsigned long *pc, *saved_code, count;
 	unsigned long ret, *src, *dst;
 	pid_t parasite;
 	int i, status;
@@ -218,16 +195,22 @@ static void insert_parasite(pid_t tid)
 	assert(!sigfillset(&sigset));
 	assert(!ptrace(PTRACE_SETSIGMASK, tid, NULL, &sigset));
 
+	count = DIV_ROUND_UP(max(test_blob_size, max(mmap_blob_size,
+			     max(clone_blob_size, munmap_blob_size))),
+			     sizeof(unsigned long));
+	saved_code = malloc(sizeof(unsigned long) * count);
+	assert(saved_code);
+
+	pc = (void *)round_down(orig_uregs.rip, 4096);
+	for (i = 0; i < count; i++)
+		saved_code[i] = ptrace(PTRACE_PEEKDATA, tid, pc + i, NULL);
+
 	printf("executing test blob\n");
-	ctx = prepare_host(tid, test_blob, test_blob_size, 0);
-	execute_blob(tid);
-	release_host(tid, ctx);
+	execute_blob(tid, orig_uregs, pc, test_blob, test_blob_size, 0);
 
 	printf("executing mmap blob");
-	ctx = prepare_host(tid, mmap_blob, mmap_blob_size, 0);
-	ret = execute_blob(tid);
+	ret = execute_blob(tid, orig_uregs, pc, mmap_blob, mmap_blob_size, 0);
 	printf(" = %#lx\n", ret);
-	release_host(tid, ctx);
 	assert(ret < -4096LU);
 
 	dst = (void *)ret;
@@ -237,9 +220,8 @@ static void insert_parasite(pid_t tid)
 		assert(!ptrace(PTRACE_POKEDATA, tid, dst + i, *(src + i)));
 
 	printf("executing clone blob");
-	ctx = prepare_host(tid, clone_blob, clone_blob_size,
-			   (unsigned long)dst);
-	parasite = execute_blob(tid);
+	parasite = execute_blob(tid, orig_uregs, pc, clone_blob,
+				clone_blob_size, (unsigned long)dst);
 	printf(" = %d\n", parasite);
 	assert(parasite >= 0);
 
@@ -250,15 +232,16 @@ static void insert_parasite(pid_t tid)
 	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
 	assert(WIFEXITED(status));
 
-	release_host(tid, ctx);
-
 	printf("executing munmap blob");
-	ctx = prepare_host(tid, munmap_blob, munmap_blob_size,
+	ret = execute_blob(tid, orig_uregs, pc, munmap_blob, munmap_blob_size,
 			   (unsigned long)dst);
-	ret = execute_blob(tid);
 	printf(" = %ld\n", ret);
-	release_host(tid, ctx);
 	assert(!ret);
+
+	for (i = 0; i < count; i++)
+		assert(!ptrace(PTRACE_POKEDATA, tid, pc + i,
+			       (void *)saved_code[i]));
+	free(saved_code);
 
 	assert(!ptrace(PTRACE_SETSIGMASK, tid, NULL, &orig_sigset));
 	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &orig_uregs));
