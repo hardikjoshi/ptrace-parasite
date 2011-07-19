@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <signal.h>
 #include <sched.h>
+#include <time.h>
 
 #define PTRACE_SEIZE		0x4206
 #define PTRACE_INTERRUPT	0x4207
@@ -74,8 +75,8 @@ static int seize_process(pid_t pid)
 
 #include "parasite-blob.h"
 
-extern char test_blob[], mmap_blob[], clone_blob[];
-extern int test_blob_size, mmap_blob_size, clone_blob_size;
+extern char test_blob[], mmap_blob[], clone_blob[], munmap_blob[];
+extern int test_blob_size, mmap_blob_size, clone_blob_size, munmap_blob_size;
 
 static void __attribute__((used)) insertion_blob_container(void)
 {
@@ -101,10 +102,10 @@ static void __attribute__((used)) insertion_blob_container(void)
 		     "syscall				\n\t"
 		     "int $0x03				\n\t"
 		     "mmap_blob_size:			\n\t"
-		     ".int mmap_blob_size - mmap_blob	\n\t" ::
-		     "i" (sizeof(parasite_blob)),
-		     "i" (PROT_EXEC | PROT_READ | PROT_WRITE),
-		     "i" (MAP_ANONYMOUS | MAP_PRIVATE));
+		     ".int mmap_blob_size - mmap_blob	\n\t"
+		     :: "i" (sizeof(parasite_blob)),
+		        "i" (PROT_EXEC | PROT_READ | PROT_WRITE),
+		        "i" (MAP_ANONYMOUS | MAP_PRIVATE));
 
 	/* expects parasite address in %r15 */
 	asm volatile("clone_blob:			\n\t"
@@ -119,10 +120,21 @@ static void __attribute__((used)) insertion_blob_container(void)
 		     "jmp *%%r15			\n\t" /* jmp parasite */
 		     "1: int $0x03			\n\t"
 		     "clone_blob_size:			\n\t"
-		     ".int clone_blob_size - clone_blob	\n\t" ::
-		     "i" (CLONE_FILES | CLONE_FS | CLONE_IO | CLONE_SIGHAND |
-			  CLONE_SYSVSEM | CLONE_THREAD | CLONE_VM/* |
-								    CLONE_PTRACE*/));
+		     ".int clone_blob_size - clone_blob	\n\t"
+		     :: "i" (CLONE_FILES | CLONE_FS | CLONE_IO | CLONE_SIGHAND |
+			     CLONE_SYSVSEM | CLONE_THREAD | CLONE_VM |
+			     CLONE_PTRACE));
+
+	/* expects mmap address in %r15 */
+	asm volatile("munmap_blob:			\n\t"
+		     "movq $11, %%rax			\n\t" /* munmap */
+		     "movq %%r15, %%rdi			\n\t" /* @addr */
+		     "movq %0, %%rsi			\n\t" /* @len */
+		     "syscall				\n\t"
+		     "int $0x03				\n\t"
+		     "munmap_blob_size:			\n\t"
+		     ".int munmap_blob_size - munmap_blob\n\t"
+		     :: "i" (sizeof(parasite_blob)));
 }
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
@@ -199,7 +211,7 @@ static void insert_parasite(pid_t tid)
 	struct host_ctx *ctx;
 	unsigned long ret, *src, *dst;
 	pid_t parasite;
-	int i;
+	int i, status;
 
 	assert(!ptrace(PTRACE_GETREGS, tid, NULL, &orig_uregs));
 	assert(!ptrace(PTRACE_GETSIGMASK, tid, NULL, &orig_sigset));
@@ -229,8 +241,24 @@ static void insert_parasite(pid_t tid)
 			   (unsigned long)dst);
 	parasite = execute_blob(tid);
 	printf(" = %d\n", parasite);
-	release_host(tid, ctx);
 	assert(parasite >= 0);
+
+	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
+	assert(WIFSTOPPED(status));
+	printf("executing parasite\n");
+	assert(!ptrace(PTRACE_CONT, parasite, NULL, NULL));
+	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
+	assert(WIFEXITED(status));
+
+	release_host(tid, ctx);
+
+	printf("executing munmap blob");
+	ctx = prepare_host(tid, munmap_blob, munmap_blob_size,
+			   (unsigned long)dst);
+	ret = execute_blob(tid);
+	printf(" = %ld\n", ret);
+	release_host(tid, ctx);
+	assert(!ret);
 
 	assert(!ptrace(PTRACE_SETSIGMASK, tid, NULL, &orig_sigset));
 	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &orig_uregs));
