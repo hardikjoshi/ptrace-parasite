@@ -175,6 +175,7 @@ static unsigned long execute_blob(pid_t tid, struct user_regs_struct uregs,
 				  unsigned long *pc, const char *blob,
 				  size_t size, unsigned long r15)
 {
+	siginfo_t si;
 	int i, status;
 
 	/* inject blob into the host */
@@ -199,6 +200,8 @@ static unsigned long execute_blob(pid_t tid, struct user_regs_struct uregs,
 	assert(!ptrace(PTRACE_CONT, tid, NULL, NULL));
 	assert(wait4(tid, &status, __WALL, NULL) == tid);
 	assert(WIFSTOPPED(status));
+	assert(!ptrace(PTRACE_GETSIGINFO, tid, NULL, &si));
+	assert(si.si_code >> 8 == PTRACE_EVENT_STOP);
 
 	/* retrieve return value */
 	assert(!ptrace(PTRACE_GETREGS, tid, NULL, &uregs));
