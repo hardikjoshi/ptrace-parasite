@@ -125,17 +125,16 @@ static void __attribute__((used)) insertion_blob_container(void)
 		     "test_blob_size:			\n\t"
 		     ".int test_blob_size - test_blob	\n\t");
 
-	/* XXX make r15 point to memory area */
-	/* rt_sigprocmask(), expects new mask and returns old mask in %r15 */
+	/* rt_sigprocmask(), expects pointer to area for masks in %r15 */
 	asm volatile("sigprocmask_blob:			\n\t"
-		     "movq %%r15, -8(%%rsp)		\n\t"
 		     "movq $14, %%rax			\n\t" /* rt_sigprocmask */
 		     "movq %0, %%rdi			\n\t" /* @how */
-		     "leaq -8(%%rsp), %%rsi		\n\t" /* @nset */
-		     "leaq -16(%%rsp), %%rdx		\n\t" /* @oset */
+		     "movq %%r15, %%rsi			\n\t" /* @nset */
+		     "addq $8, %%r15			\n\t"
+		     "movq %%r15, %%rdx			\n\t" /* @oset */
 		     "movq $8, %%r10			\n\t" /* @sigsetsize */
 		     "syscall				\n\t"
-		     "movq -16(%%rsp), %%r15		\n\t"
+		     "movq (%%r15), %%r15		\n\t" /* *@oset */
 		     "int $0x03				\n\t"
 		     "sigprocmask_blob_size:		\n\t"
 		     ".int sigprocmask_blob_size - sigprocmask_blob \n\t"
@@ -324,7 +323,8 @@ static void insert_parasite(pid_t tid)
 
 	/* block all signals */
 	printf("blocking all signals");
-	r15 = -1LU;
+	assert(!ptrace(PTRACE_POKEDATA, tid, sp, (void *)-1LU));
+	r15 = (unsigned long)sp;
 	ret = execute_blob(tid, pc,
 			   sigprocmask_blob, sigprocmask_blob_size, &r15);
 	printf(" = %#lx, prev_sigmask %#lx\n", ret, r15);
@@ -369,13 +369,14 @@ static void insert_parasite(pid_t tid)
 
 	/* restore the original sigmask */
 	printf("restoring sigmask");
-	r15 = saved_sigmask;
+	assert(!ptrace(PTRACE_POKEDATA, tid, sp, (void *)saved_sigmask));
+	r15 = (unsigned long)sp;
 	ret = execute_blob(tid, pc,
 			   sigprocmask_blob, sigprocmask_blob_size, &r15);
 	printf(" = %#lx, prev_sigmask %#lx\n", ret, r15);
 	assert(!ret);
 
-	/* restore the original code, stack and register */
+	/* restore the original code and stack area */
 	for (i = 0; i < count; i++)
 		assert(!ptrace(PTRACE_POKEDATA, tid, pc + i,
 			       (void *)saved_code[i]));
