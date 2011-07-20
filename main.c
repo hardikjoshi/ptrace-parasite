@@ -15,12 +15,11 @@
 #include <signal.h>
 #include <sched.h>
 #include <time.h>
+#include <string.h>
 
 #define PTRACE_SEIZE		0x4206
 #define PTRACE_INTERRUPT	0x4207
 #define PTRACE_LISTEN		0x4208
-#define PTRACE_GETSIGMASK	0x4209
-#define PTRACE_SETSIGMASK	0x4210
 
 #define PTRACE_SEIZE_DEVEL	0x80000000 /* temp flag for development */
 
@@ -88,6 +87,8 @@ static int seize_process(pid_t pid)
 		assert(WIFSTOPPED(status));
 		assert(!ptrace(PTRACE_GETSIGINFO, tid, NULL, &si));
 		assert(si.si_code >> 8 == PTRACE_EVENT_STOP);
+		assert(!ptrace(PTRACE_SETOPTIONS, tid, NULL,
+			       (void *)(unsigned long)PTRACE_O_TRACEEXIT));
 
 		tids[nr_threads++] = tid;
 	}
@@ -102,8 +103,8 @@ static int seize_process(pid_t pid)
  */
 #include "parasite-blob.h"
 
-extern char test_blob[], mmap_blob[], clone_blob[], munmap_blob[];
-extern int test_blob_size, mmap_blob_size, clone_blob_size, munmap_blob_size;
+extern char test_blob[], sigprocmask_blob[], mmap_blob[], clone_blob[], munmap_blob[];
+extern int test_blob_size, sigprocmask_blob_size, mmap_blob_size, clone_blob_size, munmap_blob_size;
 
 static void __attribute__((used)) insertion_blob_container(void)
 {
@@ -123,6 +124,22 @@ static void __attribute__((used)) insertion_blob_container(void)
 		     "1: .ascii \"hello, world!\\n\"	\n\t"
 		     "test_blob_size:			\n\t"
 		     ".int test_blob_size - test_blob	\n\t");
+
+	/* XXX make r15 point to memory area */
+	/* rt_sigprocmask(), expects new mask and returns old mask in %r15 */
+	asm volatile("sigprocmask_blob:			\n\t"
+		     "movq %%r15, -8(%%rsp)		\n\t"
+		     "movq $14, %%rax			\n\t" /* rt_sigprocmask */
+		     "movq %0, %%rdi			\n\t" /* @how */
+		     "leaq -8(%%rsp), %%rsi		\n\t" /* @nset */
+		     "leaq -16(%%rsp), %%rdx		\n\t" /* @oset */
+		     "movq $8, %%r10			\n\t" /* @sigsetsize */
+		     "syscall				\n\t"
+		     "movq -16(%%rsp), %%r15		\n\t"
+		     "int $0x03				\n\t"
+		     "sigprocmask_blob_size:		\n\t"
+		     ".int sigprocmask_blob_size - sigprocmask_blob \n\t"
+		     :: "i" (SIG_SETMASK));
 
 	/* mmaps anon area for parasite_blob */
 	asm volatile("mmap_blob:			\n\t"
@@ -171,10 +188,11 @@ static void __attribute__((used)) insertion_blob_container(void)
 		     :: "i" (sizeof(parasite_blob)));
 }
 
-static unsigned long execute_blob(pid_t tid, struct user_regs_struct uregs,
-				  unsigned long *pc, const char *blob,
-				  size_t size, unsigned long r15)
+static unsigned long execute_blob(pid_t tid, unsigned long *pc,
+				  const char *blob, size_t size,
+				  unsigned long *r15)
 {
+	struct user_regs_struct uregs, saved_uregs;
 	siginfo_t si;
 	int i, status;
 
@@ -182,70 +200,140 @@ static unsigned long execute_blob(pid_t tid, struct user_regs_struct uregs,
 	for (i = 0; i < DIV_ROUND_UP(size, sizeof(unsigned long)); i++)
 		assert(!ptrace(PTRACE_POKEDATA, tid, pc + i,
 			       (void *)*((unsigned long *)blob + i)));
+retry:
+	assert(!ptrace(PTRACE_GETREGS, tid, NULL, &uregs));
+	saved_uregs = uregs;
 
 	uregs.orig_rax = -1;		/* avoid end-of-syscall processing */
 	uregs.rip = (unsigned long)pc;	/* point to the injected blob */
-	uregs.r15 = r15;		/* used as parameter to blob */
+	if (r15)
+		uregs.r15 = *r15;	/* used as parameter to blob */
+
 	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &uregs));
 
-	/*
-	 * Let the blob run, upon completion it will trigger debug trap.
-	 * After debug trap is reached, put it back to jobctl trap using
-	 * INTERRUPT.
-	 */
+	/* let the blob run, upon completion it will trigger debug trap */
 	assert(!ptrace(PTRACE_CONT, tid, NULL, NULL));
 	assert(wait4(tid, &status, __WALL, NULL) == tid);
 	assert(WIFSTOPPED(status));
+	assert(!ptrace(PTRACE_GETSIGINFO, tid, NULL, &si));
+
+	if (WSTOPSIG(status) != SIGTRAP || si.si_code != SI_KERNEL) {
+		/*
+		 * The only other thing which can happen is signal
+		 * delivery.  Restore registers so that signal frame
+		 * preparation operates on the original state, schedule
+		 * INTERRUPT and let the delivery happen.
+		 *
+		 * If the signal has user handler, signal code will
+		 * schedule handler by modifying userland memory and
+		 * registers and return to jobctl trap.  STOP handling will
+		 * modify jobctl state and also return to jobctl trap and
+		 * there isn't much we can do about KILL handling.
+		 *
+		 * So, regardless of signo, we can simply retry after
+		 * control returns to jboctl trap.
+		 *
+		 * Note that if signal is delivered between syscall and
+		 * int3 in the blob, the syscall might be executed again.
+		 * Block signals first before doing any operation with side
+		 * effects.
+		 */
+	retry_signal:
+		printf("** delivering signal %d si_code=%d\n",
+		       si.si_signo, si.si_code);
+		assert(si.si_code <= 0);
+		assert(!ptrace(PTRACE_SETREGS, tid, NULL, (void *)&saved_uregs));
+		assert(!ptrace(PTRACE_INTERRUPT, tid, NULL, NULL));
+		assert(!ptrace(PTRACE_CONT, tid, NULL,
+			       (void *)(unsigned long)si.si_signo));
+
+		/* wait for trap */
+		assert(wait4(tid, &status, __WALL, NULL) == tid);
+		assert(WIFSTOPPED(status));
+		assert(!ptrace(PTRACE_GETSIGINFO, tid, NULL, &si));
+
+		/* are we back at jobctl trap or are there more signals? */
+		if (si.si_code >> 8 != PTRACE_EVENT_STOP)
+			goto retry_signal;
+
+		/* otherwise, retry */
+		goto retry;
+	}
+
+	/*
+	 * Okay, this is the SIGTRAP delivery from int3.  Steer the thread
+	 * back to jobctl trap by raising INTERRUPT and squashing SIGTRAP.
+	 */
 	assert(!ptrace(PTRACE_INTERRUPT, tid, NULL, NULL));
 	assert(!ptrace(PTRACE_CONT, tid, NULL, NULL));
+
 	assert(wait4(tid, &status, __WALL, NULL) == tid);
 	assert(WIFSTOPPED(status));
 	assert(!ptrace(PTRACE_GETSIGINFO, tid, NULL, &si));
 	assert(si.si_code >> 8 == PTRACE_EVENT_STOP);
 
-	/* retrieve return value */
+	/* retrieve return value and restore registers */
 	assert(!ptrace(PTRACE_GETREGS, tid, NULL, &uregs));
+	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &saved_uregs));
+	if (r15)
+		*r15 = uregs.r15;
 	return uregs.rax;
 }
 
 static void insert_parasite(pid_t tid)
 {
-	struct user_regs_struct orig_uregs;
-	sigset_t orig_sigset, sigset;
-	unsigned long *pc, *saved_code, count;
-	unsigned long ret, *src, *dst;
+	struct user_regs_struct uregs;
+	unsigned long *pc, *sp, *saved_code, saved_stack[16];
+	unsigned long r15, saved_sigmask, ret, *src, *dst;
 	pid_t parasite;
-	int i, status;
-
-	/* save registers and sigmask, and block all signals */
-	assert(!ptrace(PTRACE_GETREGS, tid, NULL, &orig_uregs));
-	assert(!ptrace(PTRACE_GETSIGMASK, tid, NULL, &orig_sigset));
-	assert(!sigfillset(&sigset));
-	assert(!ptrace(PTRACE_SETSIGMASK, tid, NULL, &sigset));
+	int i, count, status;
 
 	/* allocate space to save original code */
-	count = DIV_ROUND_UP(max(test_blob_size, max(mmap_blob_size,
-			     max(clone_blob_size, munmap_blob_size))),
+	count = DIV_ROUND_UP(max(test_blob_size,
+			     max(sigprocmask_blob_size,
+			     max(mmap_blob_size,
+			     max(clone_blob_size,
+				 munmap_blob_size)))),
 			     sizeof(unsigned long));
 	saved_code = malloc(sizeof(unsigned long) * count);
 	assert(saved_code);
+
+	assert(!ptrace(PTRACE_GETREGS, tid, NULL, &uregs));
 
 	/*
 	 * The page %rip is on gotta be executable.  If we inject from the
 	 * beginning of the page, there should be at least one page of
 	 * space.  Determine the position and save the original code.
 	 */
-	pc = (void *)round_down(orig_uregs.rip, 4096);
+	pc = (void *)round_down(uregs.rip, 4096);
 	for (i = 0; i < count; i++)
 		saved_code[i] = ptrace(PTRACE_PEEKDATA, tid, pc + i, NULL);
 
+	/*
+	 * Save and restore some bytes below %rsp so that blobs can use it
+	 * as writeable scratch area.  This wouldn't be necessary if mmap
+	 * is done earlier.
+	 */
+	sp = (void *)uregs.rsp - sizeof(saved_stack);
+	for (i = 0; i < sizeof(saved_stack) / sizeof(saved_stack[0]); i++)
+		saved_stack[i] = ptrace(PTRACE_PEEKDATA, tid, sp + i, NULL);
+
 	/* say hi! */
 	printf("executing test blob\n");
-	execute_blob(tid, orig_uregs, pc, test_blob, test_blob_size, 0);
+	execute_blob(tid, pc, test_blob, test_blob_size, NULL);
+
+	/* block all signals */
+	printf("blocking all signals");
+	r15 = -1LU;
+	ret = execute_blob(tid, pc,
+			   sigprocmask_blob, sigprocmask_blob_size, &r15);
+	printf(" = %#lx, prev_sigmask %#lx\n", ret, r15);
+	saved_sigmask = r15;
+	assert(!ret);
 
 	/* mmap space for parasite */
 	printf("executing mmap blob");
-	ret = execute_blob(tid, orig_uregs, pc, mmap_blob, mmap_blob_size, 0);
+	ret = execute_blob(tid, pc, mmap_blob, mmap_blob_size, NULL);
 	printf(" = %#lx\n", ret);
 	assert(ret < -4096LU);
 
@@ -258,8 +346,8 @@ static void insert_parasite(pid_t tid)
 
 	/* clone parasite which will trap and wait for instruction */
 	printf("executing clone blob");
-	parasite = execute_blob(tid, orig_uregs, pc, clone_blob,
-				clone_blob_size, (unsigned long)dst);
+	r15 = (unsigned long)dst;
+	parasite = execute_blob(tid, pc, clone_blob, clone_blob_size, &r15);
 	printf(" = %d\n", parasite);
 	assert(parasite >= 0);
 
@@ -267,26 +355,36 @@ static void insert_parasite(pid_t tid)
 	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
 	assert(WIFSTOPPED(status));
 	printf("executing parasite\n");
-	assert(!ptrace(PTRACE_CONT, parasite, NULL, NULL));
-	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
-	assert(WIFEXITED(status));
+	do {
+		assert(!ptrace(PTRACE_CONT, parasite, NULL, NULL));
+		assert(wait4(parasite, &status, __WALL, NULL) == parasite);
+	} while (!WIFEXITED(status));
 
 	/* parasite is done, munmap parasite_blob area */
 	printf("executing munmap blob");
-	ret = execute_blob(tid, orig_uregs, pc, munmap_blob, munmap_blob_size,
-			   (unsigned long)dst);
+	r15 = (unsigned long)dst;
+	ret = execute_blob(tid, pc, munmap_blob, munmap_blob_size, &r15);
 	printf(" = %ld\n", ret);
 	assert(!ret);
 
-	/* restore the original code */
+	/* restore the original sigmask */
+	printf("restoring sigmask");
+	r15 = saved_sigmask;
+	ret = execute_blob(tid, pc,
+			   sigprocmask_blob, sigprocmask_blob_size, &r15);
+	printf(" = %#lx, prev_sigmask %#lx\n", ret, r15);
+	assert(!ret);
+
+	/* restore the original code, stack and register */
 	for (i = 0; i < count; i++)
 		assert(!ptrace(PTRACE_POKEDATA, tid, pc + i,
 			       (void *)saved_code[i]));
-	free(saved_code);
 
-	/* restore the original sigmask and registers */
-	assert(!ptrace(PTRACE_SETSIGMASK, tid, NULL, &orig_sigset));
-	assert(!ptrace(PTRACE_SETREGS, tid, NULL, &orig_uregs));
+	for (i = 0; i < sizeof(saved_stack) / sizeof(saved_stack[0]); i++)
+		assert(!ptrace(PTRACE_POKEDATA, tid, sp + i,
+			       (void *)saved_stack[i]));
+
+	free(saved_code);
 }
 
 int main(int argc, char **argv)
