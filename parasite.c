@@ -89,8 +89,8 @@ static void __attribute__((used)) parasite_entry_container(void)
 {
 	/*
 	 * Entry code sets up stack frame and calls parasite which
-	 * shouldn't return.  This is put inside .entry.text section will
-	 * be put at the head of the blob by linker script.
+	 * shouldn't return.  This is put inside .entry.text section which
+	 * will be linked at the head of the blob by linker script.
 	 */
 	asm volatile(".pushsection .entry.text, \"ax\"			\n\t"
 		     "leaq stack_area + "__stringify(STACK_SIZE)"(%rip), %rsp\n\t"
