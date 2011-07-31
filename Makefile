@@ -1,4 +1,4 @@
-all: parasite simple-host
+all: parasite simple-host net-host
 
 parasite: main.c parasite-blob.h
 	gcc -Wall -o parasite main.c
@@ -13,5 +13,8 @@ parasite-blob.h: parasite.c parasite.lds
 simple-host: simple-host.c
 	gcc -Wall -o simple-host simple-host.c -lpthread
 
+net-host: net-host.c
+	gcc -Wall -o net-host net-host.c -lpthread
+
 clean:
-	rm -f parasite parasite-blob.h *.o *.bin simple-host
+	rm -f parasite parasite-blob.h *.o *.bin simple-host net-host
