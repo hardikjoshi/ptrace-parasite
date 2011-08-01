@@ -1,88 +1,124 @@
-#include <sys/types.h>
-#include <time.h>
+#include "parasite.h"
+#include "syscall.h"
 
 #define STACK_SIZE	16384
 
 static unsigned long __attribute__((used)) stack_area[STACK_SIZE / sizeof(unsigned long)];
 extern const int ctrl_port;
 
-#define __NR_write	1
-#define __NR_exit	60
-#define __NR_gettid	186
-#define __NR_time	201
-
 #define __stringify_1(x...)	#x
 #define __stringify(x...)	__stringify_1(x)
 
-static ssize_t sys_write(int fd, const void *buf, size_t count)
-{
-	ssize_t ret;
-
-	asm volatile("syscall"
-		     : "=a" (ret)
-		     : "a" (__NR_write), "D" (fd), "S" (buf), "d" (count));
-	return ret;
-}
-
-static long sys_exit(int error_code)
-{
-	long ret;
-
-	asm volatile("syscall"
-		     : "=a" (ret)
-		     : "a" (__NR_exit), "D" (error_code));
-	return ret;
-}
-
-static long sys_gettid(void)
-{
-	long ret;
-
-	asm volatile("syscall" : "=a" (ret) : "a" (__NR_gettid));
-	return ret;
-}
-
-static long sys_time(void)
-{
-	long ret;
-
-	asm volatile("syscall" : "=a" (ret) : "a" (__NR_time), "D" (NULL));
-	return ret;
-}
-
-static char *simple_long_to_str(long v, int *len)
+static char *long_to_str(long v)
 {
 	static char buf[128];
 	char *p = &buf[128];
+	int minus = 0;
 
-	*len = 0;
+	if (v < 0) {
+		minus = 1;
+		v = -v;
+	}
+
 	while (v) {
 		*--p = '0' + (v % 10);
-		(*len)++;
 		v /= 10;
 	}
+	if (minus)
+		*--p = '-';
+
 	return p;
 }
 
-static void __attribute__((used)) parasite(void)
+static void print_msg(const char *msg)
 {
-	static const char str0[] = "parasite: hello, world!\n";
-	static const char str1[] = "parasite: tid / time = ";
-	pid_t tid = sys_gettid();
-	time_t time = sys_time();
-	char *p;
-	int len;
+	int sz;
 
-	sys_write(1, str0, sizeof(str0));
-	sys_write(1, str1, sizeof(str1));
+	for (sz = 0; msg[sz] != '\0'; sz++)
+		;
+	sys_write(1, msg, sz);
+}
 
-	p = simple_long_to_str(tid, &len);
-	sys_write(1, p, len);
-	sys_write(1, " / ", 3);
-	p = simple_long_to_str(time, &len);
-	sys_write(1, p, len);
-	sys_write(1, "\n", 1);
+static void __attribute__((used)) parasite(int cmd_port)
+{
+	static char data[PCMD_MAX_DATA];
+	struct sockaddr_in in = { .sin_family = AF_INET,
+				  .sin_addr.s_addr = 0x0100007f,
+				  .sin_port = cmd_port };
+	const char *emsg = NULL;
+	struct parasite_cmd cmd = { };
+	struct iovec cmd_iov = { .iov_base = &cmd, .iov_len = sizeof(cmd) };
+	struct msghdr cmd_mh = { .msg_iov = &cmd_iov, .msg_iovlen = 1 };
+	struct iovec data_iov = { .iov_base = data };
+	struct msghdr data_mh = { .msg_iov = &data_iov, .msg_iovlen = 1 };
+	long ret;
+	int sock;
 
+	print_msg("PARASITE STARTED\n");
+
+	if ((ret = sys_socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+		emsg = "socket";
+		goto exit;
+	}
+	sock = ret;
+
+	if ((ret = sys_connect(sock, (struct sockaddr *)&in, sizeof(in))) < 0) {
+		emsg = "connect";
+		goto exit;
+	}
+
+	while ((ret = sys_recvmsg(sock, &cmd_mh, MSG_WAITALL)) == sizeof(cmd)) {
+		long opcode = cmd.opcode;
+		unsigned long arg = cmd.arg;
+		unsigned long data_len = cmd.data_len;
+		int quit = 0;
+
+		cmd = (struct parasite_cmd){};
+
+		data_iov.iov_len = data_len;
+		if (data_len &&
+		    (ret = sys_recvmsg(sock, &data_mh, MSG_WAITALL)) != data_len) {
+			emsg = "data recvmsg";
+			goto exit;
+		}
+
+		ret = 0;
+		switch (opcode) {
+		case PCMD_SAY:
+			print_msg("PARASITE SAY: ");
+			sys_write(arg, data, data_len);
+			break;
+		case PCMD_QUIT:
+			quit = 1;
+			break;
+		}
+
+		cmd.opcode = ret;
+		if ((ret = sys_sendmsg(sock, &cmd_mh, 0)) != sizeof(cmd)) {
+			emsg = "cmd sendmsg";
+			goto exit;
+		}
+		data_iov.iov_len = cmd.data_len;
+		if (cmd.data_len &&
+		    (ret = sys_sendmsg(sock, &data_mh, 0)) != cmd.data_len) {
+			emsg = "data sendmsg";
+			goto exit;
+		}
+
+		if (quit) {
+			sys_close(sock);
+			goto exit;
+		}
+	}
+	emsg = "cmd recvmsg";
+exit:
+	if (emsg) {
+		print_msg("PARASITE ERROR: ");
+		print_msg(emsg);
+		print_msg(" ret=");
+		print_msg(long_to_str(ret));
+		print_msg("\n");
+	}
 	sys_exit(0);
 }
 
@@ -97,9 +133,10 @@ static void __attribute__((used)) parasite_entry_container(void)
 		     "leaq stack_area + "__stringify(STACK_SIZE)"(%rip), %rsp\n\t"
 		     "pushq $0						\n\t"
 		     "movq %rsp, %rbp					\n\t"
+		     "movl cmd_port(%rip), %edi				\n\t"
 		     "call parasite					\n\t"
 		     "int $0x03						\n\t"
-		     ".align 64						\n\t"
-		     "ctrl_port: .int 0xdeadbeef			\n\t"
+		     ".align "__stringify(PCMD_PORT_OFFSET)"		\n\t"
+		     "cmd_port: .int 0xdeadbeef				\n\t"
 		     ".popsection					\n\t");
 }

@@ -34,7 +34,7 @@
 #define MAX_THREADS	1024
 static pid_t tids[MAX_THREADS];
 static int nr_threads;
-static int ctrl_sock, ctrl_port;
+static int listen_sock, pcmd_port;
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
 #define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
@@ -125,10 +125,10 @@ static void __attribute__((used)) insertion_blob_container(void)
 		     "movq $1, %rax			\n\t" /* write */
 		     "movq $1, %rdi			\n\t" /* @fd */
 		     "leaq 1f(%rip), %rsi		\n\t" /* @buf: "hello..." */
-		     "movq $14, %rdx			\n\t" /* @count */
+		     "movq $20, %rdx			\n\t" /* @count */
 		     "syscall				\n\t"
 		     "int $0x03				\n\t"
-		     "1: .ascii \"hello, world!\\n\"	\n\t"
+		     "1: .ascii \"BLOB: hello, world!\\n\"\n\t"
 		     "test_blob_size:			\n\t"
 		     ".int test_blob_size - test_blob	\n\t");
 
@@ -286,6 +286,56 @@ retry:
 	return uregs.rax;
 }
 
+static int parasite_cmd(int sock, int opcode, unsigned long *arg,
+			void **data, unsigned long *data_len)
+{
+	struct parasite_cmd cmd = { .opcode = opcode, .arg = arg ? *arg : 0,
+				    .data_len = data_len ? *data_len : 0 };
+
+	printf("send cmd\n");
+	assert(send(sock, &cmd, sizeof(cmd), 0) == sizeof(cmd));
+	if (data_len && *data_len) {
+		assert(*data_len <= PCMD_MAX_DATA);
+		assert(data && *data);
+		assert(send(sock, *data, *data_len, 0) == *data_len);
+	}
+
+	assert(recv(sock, &cmd, sizeof(cmd), MSG_WAITALL) == sizeof(cmd));
+	if (arg)
+		*arg = cmd.arg;
+	if (data_len) {
+		*data_len = cmd.data_len;
+		if (*data_len) {
+			assert(*data_len <= PCMD_MAX_DATA);
+			assert(data && *data);
+			assert(recv(sock, *data, *data_len,
+				    MSG_WAITALL) == *data_len);
+		}
+	}
+	return cmd.opcode;
+}
+
+static void parasite_sequencer(void)
+{
+	const char hello[] = "hello, world!\n";
+	unsigned long arg;
+	void *data;
+	unsigned long data_len;
+	int sock;
+
+	printf("waiting for connection...");
+	fflush(stdout);
+	assert((sock = accept(listen_sock, NULL, NULL)) >= 0);
+	printf(" connected\n");
+
+	arg = 1;
+	data = (void *)hello;
+	data_len = sizeof(hello);
+	assert(!parasite_cmd(sock, PCMD_SAY, &arg, &data, &data_len));
+
+	assert(!parasite_cmd(sock, PCMD_QUIT, NULL, NULL, NULL));
+}
+
 static void insert_parasite(pid_t tid)
 {
 	struct user_regs_struct uregs;
@@ -362,10 +412,16 @@ static void insert_parasite(pid_t tid)
 	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
 	assert(WIFSTOPPED(status));
 	printf("executing parasite\n");
-	do {
-		assert(!ptrace(PTRACE_CONT, parasite, NULL, NULL));
-		assert(wait4(parasite, &status, __WALL, NULL) == parasite);
-	} while (!WIFEXITED(status));
+	assert(!ptrace(PTRACE_CONT, parasite, NULL, NULL));
+
+	parasite_sequencer();
+
+	/* wait for termination */
+	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
+	assert(!ptrace(PTRACE_CONT, parasite, NULL, NULL));
+	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
+	printf("stats=%x\n", status);
+	assert(WIFEXITED(status));
 
 	/* parasite is done, munmap parasite_blob area */
 	printf("executing munmap blob");
@@ -402,6 +458,7 @@ int main(int argc, char **argv)
 				  .sin_port = 0, };
 	pid_t pid, tid;
 	socklen_t len;
+	int v;
 
 	if (argc < 2) {
 		fprintf(stderr, "Usage: parasite PID\n");
@@ -410,19 +467,19 @@ int main(int argc, char **argv)
 	pid = strtoul(argv[1], NULL, 0);
 
 	/* verify signature at port offset in parasite blob */
-	memcpy(&ctrl_port, parasite_blob + CTRL_PORT_OFFSET, sizeof(ctrl_port));
-	assert(ctrl_port == 0xdeadbeef);
+	memcpy(&v, parasite_blob + PCMD_PORT_OFFSET, sizeof(v));
+	assert(v == 0xdeadbeef);
 
 	/* create control socket and record port number in the parasite blob */
-	assert((ctrl_sock = socket(AF_INET, SOCK_STREAM, 0)) >= 0);
-	assert(!bind(ctrl_sock, (struct sockaddr *)&in, sizeof(in)));
-	assert(!listen(ctrl_sock, 1));
+	assert((listen_sock = socket(AF_INET, SOCK_STREAM, 0)) >= 0);
+	assert(!bind(listen_sock, (struct sockaddr *)&in, sizeof(in)));
+	assert(!listen(listen_sock, 1));
 
 	len = sizeof(in);
-	assert(!getsockname(ctrl_sock, (struct sockaddr *)&in, &len));
+	assert(!getsockname(listen_sock, (struct sockaddr *)&in, &len));
 	assert(len == sizeof(in));
-	ctrl_port = in.sin_port;
-	memcpy(parasite_blob + CTRL_PORT_OFFSET, &ctrl_port, sizeof(ctrl_port));
+	pcmd_port = in.sin_port;
+	memcpy(parasite_blob + PCMD_PORT_OFFSET, &pcmd_port, sizeof(pcmd_port));
 
 	/* seize and insert parasite */
 	seize_process(pid);
