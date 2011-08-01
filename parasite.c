@@ -4,6 +4,7 @@
 #define STACK_SIZE	16384
 
 static unsigned long __attribute__((used)) stack_area[STACK_SIZE / sizeof(unsigned long)];
+extern const int ctrl_port;
 
 #define __NR_write	1
 #define __NR_exit	60
@@ -98,5 +99,7 @@ static void __attribute__((used)) parasite_entry_container(void)
 		     "movq %rsp, %rbp					\n\t"
 		     "call parasite					\n\t"
 		     "int $0x03						\n\t"
+		     ".align 64						\n\t"
+		     "ctrl_port: .int 0xdeadbeef			\n\t"
 		     ".popsection					\n\t");
 }

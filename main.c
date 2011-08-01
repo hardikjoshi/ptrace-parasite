@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <stdio.h>
@@ -16,6 +17,11 @@
 #include <sched.h>
 #include <time.h>
 #include <string.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+
+#include "parasite.h"
 
 #define PTRACE_SEIZE		0x4206
 #define PTRACE_INTERRUPT	0x4207
@@ -28,6 +34,7 @@
 #define MAX_THREADS	1024
 static pid_t tids[MAX_THREADS];
 static int nr_threads;
+static int ctrl_sock, ctrl_port;
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
 #define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
@@ -390,7 +397,11 @@ static void insert_parasite(pid_t tid)
 
 int main(int argc, char **argv)
 {
+	struct sockaddr_in in = { .sin_family = AF_INET,
+				  .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+				  .sin_port = 0, };
 	pid_t pid, tid;
+	socklen_t len;
 
 	if (argc < 2) {
 		fprintf(stderr, "Usage: parasite PID\n");
@@ -398,6 +409,22 @@ int main(int argc, char **argv)
 	}
 	pid = strtoul(argv[1], NULL, 0);
 
+	/* verify signature at port offset in parasite blob */
+	memcpy(&ctrl_port, parasite_blob + CTRL_PORT_OFFSET, sizeof(ctrl_port));
+	assert(ctrl_port == 0xdeadbeef);
+
+	/* create control socket and record port number in the parasite blob */
+	assert((ctrl_sock = socket(AF_INET, SOCK_STREAM, 0)) >= 0);
+	assert(!bind(ctrl_sock, (struct sockaddr *)&in, sizeof(in)));
+	assert(!listen(ctrl_sock, 1));
+
+	len = sizeof(in);
+	assert(!getsockname(ctrl_sock, (struct sockaddr *)&in, &len));
+	assert(len == sizeof(in));
+	ctrl_port = in.sin_port;
+	memcpy(parasite_blob + CTRL_PORT_OFFSET, &ctrl_port, sizeof(ctrl_port));
+
+	/* seize and insert parasite */
 	seize_process(pid);
 	assert(nr_threads);
 	tid = tids[0];

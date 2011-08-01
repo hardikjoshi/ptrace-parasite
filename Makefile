@@ -1,9 +1,9 @@
 all: parasite simple-host net-host
 
-parasite: main.c parasite-blob.h
+parasite: main.c parasite-blob.h parasite.h
 	gcc -Wall -o parasite main.c
 
-parasite-blob.h: parasite.c parasite.lds
+parasite-blob.h: parasite.c parasite.lds parasite.h
 	gcc -Wall -fpic -c parasite.c
 	ld -T parasite.lds -o parasite.bin parasite.o
 	echo 'static char parasite_blob[] = {' > parasite-blob.h
