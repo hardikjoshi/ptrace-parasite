@@ -286,29 +286,26 @@ retry:
 	return uregs.rax;
 }
 
-static int parasite_cmd(int sock, int opcode, unsigned long *arg,
-			void **data, unsigned long *data_len)
+static long parasite_cmd(int sock, int opcode,
+			 unsigned long arg0, unsigned long arg1,
+			 void *data, unsigned long *data_len)
 {
-	struct parasite_cmd cmd = { .opcode = opcode, .arg = arg ? *arg : 0,
+	struct parasite_cmd cmd = { .opcode = opcode,
+				    .arg0 = arg0, .arg1 = arg1,
 				    .data_len = data_len ? *data_len : 0 };
 
-	printf("send cmd\n");
 	assert(send(sock, &cmd, sizeof(cmd), 0) == sizeof(cmd));
 	if (data_len && *data_len) {
-		assert(*data_len <= PCMD_MAX_DATA);
-		assert(data && *data);
-		assert(send(sock, *data, *data_len, 0) == *data_len);
+		assert(*data_len <= PCMD_MAX_DATA && data);
+		assert(send(sock, data, *data_len, 0) == *data_len);
 	}
 
 	assert(recv(sock, &cmd, sizeof(cmd), MSG_WAITALL) == sizeof(cmd));
-	if (arg)
-		*arg = cmd.arg;
 	if (data_len) {
 		*data_len = cmd.data_len;
 		if (*data_len) {
-			assert(*data_len <= PCMD_MAX_DATA);
-			assert(data && *data);
-			assert(recv(sock, *data, *data_len,
+			assert(*data_len <= PCMD_MAX_DATA && data);
+			assert(recv(sock, data, *data_len,
 				    MSG_WAITALL) == *data_len);
 		}
 	}
@@ -318,8 +315,6 @@ static int parasite_cmd(int sock, int opcode, unsigned long *arg,
 static void parasite_sequencer(void)
 {
 	const char hello[] = "hello, world!\n";
-	unsigned long arg;
-	void *data;
 	unsigned long data_len;
 	int sock;
 
@@ -328,12 +323,10 @@ static void parasite_sequencer(void)
 	assert((sock = accept(listen_sock, NULL, NULL)) >= 0);
 	printf(" connected\n");
 
-	arg = 1;
-	data = (void *)hello;
 	data_len = sizeof(hello);
-	assert(!parasite_cmd(sock, PCMD_SAY, &arg, &data, &data_len));
+	assert(!parasite_cmd(sock, PCMD_SAY, 0, 0, (void *)hello, &data_len));
 
-	assert(!parasite_cmd(sock, PCMD_QUIT, NULL, NULL, NULL));
+	assert(!parasite_cmd(sock, PCMD_QUIT, 0, 0, NULL, NULL));
 }
 
 static void insert_parasite(pid_t tid)
@@ -399,7 +392,8 @@ static void insert_parasite(pid_t tid)
 	src = (void *)parasite_blob;
 	for (i = 0; i < DIV_ROUND_UP(sizeof(parasite_blob),
 				     sizeof(unsigned long)); i++)
-		assert(!ptrace(PTRACE_POKEDATA, tid, dst + i, *(src + i)));
+		if (src[i])
+			assert(!ptrace(PTRACE_POKEDATA, tid, dst + i, src[i]));
 
 	/* clone parasite which will trap and wait for instruction */
 	printf("executing clone blob");

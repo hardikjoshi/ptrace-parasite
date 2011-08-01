@@ -72,8 +72,28 @@ static long __used syscall5(int nr, unsigned long arg0, unsigned long arg1,
 	return ret;
 }
 
+static long __used syscall6(int nr, unsigned long arg0, unsigned long arg1,
+			    unsigned long arg2, unsigned long arg3,
+			    unsigned long arg4, unsigned long arg5)
+{
+	register unsigned long r10 asm("r10") = r10;
+	register unsigned long r8 asm("r8") = r8;
+	register unsigned long r9 asm("r9") = r9;
+	long ret;
+
+	r10 = arg3;
+	r8 = arg4;
+	r9 = arg5;
+	asm volatile("syscall"
+		     : "=a" (ret)
+		     : "a" (nr), "D" (arg0), "S" (arg1), "d" (arg2)
+		     : "memory");
+	return ret;
+}
+
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -81,6 +101,8 @@ static long __used syscall5(int nr, unsigned long arg0, unsigned long arg1,
 
 #define __NR_write	1
 #define __NR_close	3
+#define __NR_mmap	9
+#define __NR_munmap	11
 #define __NR_exit	60
 #define __NR_gettid	186
 #define __NR_time	201
@@ -132,4 +154,16 @@ static ssize_t __used sys_sendmsg(int fd, const struct msghdr *msg, int flags)
 static ssize_t __used sys_recvmsg(int fd, struct msghdr *msg, int flags)
 {
 	return syscall3(__NR_recvmsg, fd, (unsigned long)msg, flags);
+}
+
+static unsigned long __used sys_mmap(void *addr, size_t len, int prot,
+				     int flags, int fd, off_t offset)
+{
+	return syscall6(__NR_mmap, (unsigned long)addr, len, prot, flags,
+			fd, offset);
+}
+
+static unsigned long __used sys_munmap(void *addr, size_t len)
+{
+	return syscall2(__NR_munmap, (unsigned long)addr, len);
 }
