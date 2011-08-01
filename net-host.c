@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -14,15 +15,61 @@
 #include <string.h>
 #include <inttypes.h>
 #include <endian.h>
+#include <linux/sockios.h>
+
+#define SIOCPEEKOUTQ	0x894F		/* peek output queue */
 
 static const struct timespec ts1ms = { .tv_nsec = 1000000 };
 static const char *contaminant = NULL;
+static int do_peek_outq;
 
 static void sigaction_handler(int signo, siginfo_t *si, void *uctx)
 {
-	printf("signal %d si_code=%#x inserting contaminant\n",
-	       signo, si->si_code);
-	contaminant = "deadbeef";
+	printf("signal %d si_code=%#x\n", signo, si->si_code);
+	if (signo == SIGUSR1)
+		contaminant = "deadbeef";
+	else
+		do_peek_outq = 1;
+}
+
+static void peek_outq(int sock, uint64_t cur)
+{
+	int size, ret;
+	char *buf, *p;
+	int nr_contaminants = 0;
+	uint64_t val;
+
+	assert(!(ioctl(sock, SIOCOUTQ, &size)));
+	buf = malloc(size);
+	assert(buf);
+
+	memcpy(buf, &size, sizeof(size));
+	ret = ioctl(sock, SIOCPEEKOUTQ, buf);
+	if (ret < 0) {
+		perror("SIOCPEEKOUTQ");
+		return;
+	}
+	assert(ret <= size);
+
+	printf("peek_outq %d bytes: ", ret);
+	cur--;
+
+	printf("[%#08llx", (unsigned long long)cur);
+
+	for (p = buf + ret - sizeof(val); p > buf; p -= sizeof(val)) {
+		memcpy(&val, p, sizeof(val));
+		val = be64toh(val);
+
+		if (val == cur) {
+			cur--;
+		} else {
+			printf(" #%#08llx", (unsigned long long)cur + 1);
+			nr_contaminants++;
+		}
+	}
+
+	printf(" %#08llx]", (unsigned long long)cur + 1);
+	printf(" nr_contaminants=%d\n", nr_contaminants);
 }
 
 static void *send_thread_fn(void *arg)
@@ -31,9 +78,16 @@ static void *send_thread_fn(void *arg)
 	uint64_t cur = 0, buf;
 
 	while (1) {
+		if (do_peek_outq) {
+			peek_outq(sock, cur);
+			do_peek_outq = 0;
+		}
+
 		if (!contaminant) {
 			buf = htobe64(cur++);
 		} else {
+			printf("inserting contaminant @%#08llx\n",
+			       (unsigned long long)cur);
 			memcpy(&buf, contaminant, sizeof(buf));
 			contaminant = NULL;
 		}
