@@ -315,13 +315,14 @@ static long parasite_cmd(int sock, int opcode,
 
 static void parasite_sequencer(void)
 {
-	const char hello[] = "hello, world!\n";
+	const char hello[] = "ah ah! mic test!\n";
 	unsigned long data_len;
-	int sock;
+	int sock, ret;
 	struct psockinfo si;
 	unsigned long len;
 	struct in_addr lin, rin;
-	char lbuf[INET_ADDRSTRLEN], rbuf[INET_ADDRSTRLEN];
+	char lstr[INET_ADDRSTRLEN], rstr[INET_ADDRSTRLEN];
+	char *in_buf = NULL, *out_buf = NULL;
 
 	printf("waiting for connection...");
 	fflush(stdout);
@@ -335,21 +336,38 @@ static void parasite_sequencer(void)
 		goto exit;
 
 	len = 0;
-	if (parasite_cmd(sock, PCMD_SOCKINFO, target_sock_fd, 0, &si, &len)) {
-		printf("PCMD_SOCKINFO failed\n");
-		goto exit;
-	}
+	assert(!parasite_cmd(sock, PCMD_SOCKINFO, target_sock_fd, 0, &si, &len));
 
 	lin.s_addr = si.local_ip;
 	rin.s_addr = si.remote_ip;
 
 	printf("target socket: %s:%d -> %s:%d in %u@%#08x out %u@%#08x\n",
-	       inet_ntop(AF_INET, &lin, lbuf, sizeof(lbuf)), ntohs(si.local_port),
-	       inet_ntop(AF_INET, &rin, rbuf, sizeof(rbuf)), ntohs(si.remote_port),
+	       inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si.local_port),
+	       inet_ntop(AF_INET, &rin, lstr, sizeof(rstr)), ntohs(si.remote_port),
 	       si.in_qsz, si.in_seq, si.out_qsz, si.out_seq);
+
+	assert(si.in_qsz <= PCMD_MAX_DATA && si.out_qsz <= PCMD_MAX_DATA);
+
+	if (si.in_qsz) {
+		assert((in_buf = malloc(si.in_qsz)));
+		data_len = 0;
+		assert((ret = parasite_cmd(sock, PCMD_PEEK_INQ, target_sock_fd,
+					   si.in_qsz, in_buf, &data_len)) >= 0);
+		si.in_qsz = data_len;
+	}
+	if (si.out_qsz) {
+		assert((out_buf = malloc(si.out_qsz)));
+		data_len = 0;
+		assert((ret = parasite_cmd(sock, PCMD_PEEK_INQ, target_sock_fd,
+					   si.out_qsz, out_buf, &data_len)) >= 0);
+		si.out_qsz = data_len;
+	}
+	printf("peeked socket buffer in %d out %d\n", si.in_qsz, si.out_qsz);
 
 exit:
 	assert(!parasite_cmd(sock, PCMD_QUIT, 0, 0, NULL, NULL));
+	free(in_buf);
+	free(out_buf);
 }
 
 static void insert_parasite(pid_t tid)

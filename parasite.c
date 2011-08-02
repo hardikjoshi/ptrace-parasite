@@ -43,57 +43,61 @@ static void print_msg(const char *msg)
 	sys_write(1, msg, sz);
 }
 
-static int get_sockinfo(int fd, struct psockinfo *si, const char **emsg)
+static int get_sockinfo(int fd, struct psockinfo *si)
 {
+	const char *emsg;
 	struct sockaddr_in sin;
 	socklen_t slen;
 	int ret;
 
 	slen = sizeof(sin);
-	if ((ret = sys_getsockname(fd, (struct sockaddr *)&sin, &slen))) {
-		*emsg = "getsockname";
-		return ret;
-	}
-	if (slen != sizeof(sin) || sin.sin_family != AF_INET) {
-		*emsg = "getsockname invalid";
-		return -EINVAL;
-	}
+	emsg = "getsockname";
+	if ((ret = sys_getsockname(fd, (struct sockaddr *)&sin, &slen)))
+		goto out;
+
+	emsg = "getsockname invalid";
+	ret = -EINVAL;
+	if (slen != sizeof(sin) || sin.sin_family != AF_INET)
+		goto out;
+
 	si->local_ip = sin.sin_addr.s_addr;
 	si->local_port = sin.sin_port;
 
 	slen = sizeof(sin);
-	if ((ret = sys_getpeername(fd, (struct sockaddr *)&sin, &slen))) {
-		*emsg = "getpeername";
-		return ret;
-	}
-	if (slen != sizeof(sin) || sin.sin_family != AF_INET) {
-		*emsg = "getpeername invalid";
-		return -EINVAL;
-	}
+	emsg = "getpeername";
+	if ((ret = sys_getpeername(fd, (struct sockaddr *)&sin, &slen)))
+		goto out;
+
+	emsg = "getpeername invalid";
+	ret = -EINVAL;
+	if (slen != sizeof(sin) || sin.sin_family != AF_INET)
+		goto out;
+
 	si->remote_ip = sin.sin_addr.s_addr;
 	si->remote_port = sin.sin_port;
 
-	if ((ret = sys_ioctl(fd, SIOCGINSEQ, (unsigned long)&si->in_seq))) {
-		*emsg = "SIOCGINSEQ";
-		return ret;
-	}
+	emsg = "SIOCGINSEQ";
+	if ((ret = sys_ioctl(fd, SIOCGINSEQ, &si->in_seq)))
+		goto out;
 
-	if ((ret = sys_ioctl(fd, SIOCGOUTSEQ, (unsigned long)&si->out_seq))) {
-		*emsg = "SIOCGOUTSEQ";
-		return ret;
-	}
+	emsg = "SIOCGOUTSEQ";
+	if ((ret = sys_ioctl(fd, SIOCGOUTSEQ, &si->out_seq)))
+		goto out;
 
-	if ((ret = sys_ioctl(fd, SIOCINQ, (unsigned long)&si->in_qsz))) {
-		*emsg = "SIOCINQ";
-		return ret;
-	}
+	emsg = "SIOCINQ";
+	if ((ret = sys_ioctl(fd, SIOCINQ, &si->in_qsz)))
+		goto out;
 
-	if ((ret = sys_ioctl(fd, SIOCOUTQ, (unsigned long)&si->out_qsz))) {
-		*emsg = "SIOCOUTQ";
-		return ret;
+	emsg = "SIOCOUTQ";
+	if ((ret = sys_ioctl(fd, SIOCOUTQ, &si->out_qsz)))
+		goto out;
+out:
+	if (ret < 0) {
+		print_msg("PARASITE get_sockinfo failed: ");
+		print_msg(emsg);
+		print_msg("\n");
 	}
-
-	return 0;
+	return ret;
 }
 
 static void __attribute__((used)) parasite(int cmd_port)
@@ -158,8 +162,27 @@ static void __attribute__((used)) parasite(int cmd_port)
 			quit = 1;
 			break;
 		case PCMD_SOCKINFO:
-			ret = get_sockinfo(arg0, (void *)data, &emsg);
+			ret = get_sockinfo(arg0, (void *)data);
 			cmd.data_len = sizeof(struct psockinfo);
+			break;
+		case PCMD_PEEK_INQ: {
+			struct iovec iov = { .iov_base = data, .iov_len = arg1 };
+			struct msghdr mh = { .msg_iov = &iov, .msg_iovlen = 1 };
+
+			ret = sys_recvmsg(arg0, &mh, MSG_WAITALL | MSG_PEEK);
+			cmd.data_len = ret > 0 ? ret : 0;
+			break;
+		}
+		case PCMD_PEEK_OUTQ:
+			*(volatile uint32_t *)data = arg1;
+			ret = sys_ioctl(arg0, SIOCPEEKOUTQ, data);
+			cmd.data_len = ret > 0 ? ret : 0;
+			break;
+		default:
+			print_msg("PARASITE unknown command ");
+			print_msg(long_to_str(opcode));
+			print_msg("\n");
+			ret = -EINVAL;
 			break;
 		}
 

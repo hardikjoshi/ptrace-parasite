@@ -142,9 +142,9 @@ static unsigned long __used sys_munmap(void *addr, size_t len)
 	return syscall2(__NR_munmap, (unsigned long)addr, len);
 }
 
-static int __used sys_ioctl(int fd, int req, unsigned long arg)
+static int __used sys_ioctl(int fd, int req, void *arg)
 {
-	return syscall3(__NR_ioctl, fd, req, arg);
+	return syscall3(__NR_ioctl, fd, req, (unsigned long)arg);
 }
 
 static int __used sys_socket(int family, int type, int protocol)
