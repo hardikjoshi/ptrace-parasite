@@ -35,6 +35,7 @@
 static pid_t tids[MAX_THREADS];
 static int nr_threads;
 static int listen_sock, pcmd_port;
+static int target_sock_fd = -1;
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
 #define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
@@ -317,6 +318,10 @@ static void parasite_sequencer(void)
 	const char hello[] = "hello, world!\n";
 	unsigned long data_len;
 	int sock;
+	struct psockinfo si;
+	unsigned long len;
+	struct in_addr lin, rin;
+	char lbuf[INET_ADDRSTRLEN], rbuf[INET_ADDRSTRLEN];
 
 	printf("waiting for connection...");
 	fflush(stdout);
@@ -326,6 +331,24 @@ static void parasite_sequencer(void)
 	data_len = sizeof(hello);
 	assert(!parasite_cmd(sock, PCMD_SAY, 0, 0, (void *)hello, &data_len));
 
+	if (target_sock_fd < 0)
+		goto exit;
+
+	len = 0;
+	if (parasite_cmd(sock, PCMD_SOCKINFO, target_sock_fd, 0, &si, &len)) {
+		printf("PCMD_SOCKINFO failed\n");
+		goto exit;
+	}
+
+	lin.s_addr = si.local_ip;
+	rin.s_addr = si.remote_ip;
+
+	printf("target socket: %s:%d -> %s:%d in %u@%#08x out %u@%#08x\n",
+	       inet_ntop(AF_INET, &lin, lbuf, sizeof(lbuf)), ntohs(si.local_port),
+	       inet_ntop(AF_INET, &rin, rbuf, sizeof(rbuf)), ntohs(si.remote_port),
+	       si.in_qsz, si.in_seq, si.out_qsz, si.out_seq);
+
+exit:
 	assert(!parasite_cmd(sock, PCMD_QUIT, 0, 0, NULL, NULL));
 }
 
@@ -455,10 +478,13 @@ int main(int argc, char **argv)
 	int v;
 
 	if (argc < 2) {
-		fprintf(stderr, "Usage: parasite PID\n");
+		fprintf(stderr, "Usage: parasite PID [sockfd]\n");
 		return 1;
 	}
 	pid = strtoul(argv[1], NULL, 0);
+
+	if (argc >= 3)
+		target_sock_fd = strtoul(argv[2], NULL, 0);
 
 	/* verify signature at port offset in parasite blob */
 	memcpy(&v, parasite_blob + PCMD_PORT_OFFSET, sizeof(v));

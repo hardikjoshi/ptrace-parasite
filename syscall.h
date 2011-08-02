@@ -96,20 +96,29 @@ static long __used syscall6(int nr, unsigned long arg0, unsigned long arg1,
 #include <sys/mman.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <linux/sockios.h>
 #include <arpa/inet.h>
 #include <time.h>
 
-#define __NR_write	1
-#define __NR_close	3
-#define __NR_mmap	9
-#define __NR_munmap	11
-#define __NR_exit	60
-#define __NR_gettid	186
-#define __NR_time	201
-#define __NR_socket	41
-#define __NR_connect	42
-#define __NR_sendmsg	46
-#define __NR_recvmsg	47
+#define __NR_write		1
+#define __NR_close		3
+#define __NR_mmap		9
+#define __NR_munmap		11
+#define __NR_ioctl		16
+#define __NR_socket		41
+#define __NR_connect		42
+#define __NR_sendmsg		46
+#define __NR_recvmsg		47
+#define __NR_getsockname	51
+#define __NR_getpeername	52
+#define __NR_exit		60
+#define __NR_gettid		186
+#define __NR_time		201
+
+#define SIOCGINSEQ	0x894C		/* get copied_seq */
+#define SIOCGOUTSEQ	0x894D		/* get write_seq */
+#define SIOCSOUTSEQ	0x894E		/* set write_seq */
+#define SIOCPEEKOUTQ	0x894F		/* peek output queue */
 
 static ssize_t __used sys_write(int fd, const void *buf, size_t count)
 {
@@ -121,19 +130,21 @@ static int __used sys_close(int fd)
 	return syscall1(__NR_close, fd);
 }
 
-static int __used sys_exit(int error_code)
+static unsigned long __used sys_mmap(void *addr, size_t len, int prot,
+				     int flags, int fd, off_t offset)
 {
-	return syscall1(__NR_exit, error_code);
+	return syscall6(__NR_mmap, (unsigned long)addr, len, prot, flags,
+			fd, offset);
 }
 
-static long __used sys_gettid(void)
+static unsigned long __used sys_munmap(void *addr, size_t len)
 {
-	return syscall0(__NR_gettid);
+	return syscall2(__NR_munmap, (unsigned long)addr, len);
 }
 
-static time_t __used sys_time(void)
+static int __used sys_ioctl(int fd, int req, unsigned long arg)
 {
-	return syscall0(__NR_time);
+	return syscall3(__NR_ioctl, fd, req, arg);
 }
 
 static int __used sys_socket(int family, int type, int protocol)
@@ -156,14 +167,39 @@ static ssize_t __used sys_recvmsg(int fd, struct msghdr *msg, int flags)
 	return syscall3(__NR_recvmsg, fd, (unsigned long)msg, flags);
 }
 
-static unsigned long __used sys_mmap(void *addr, size_t len, int prot,
-				     int flags, int fd, off_t offset)
+static int __used sys_exit(int error_code)
 {
-	return syscall6(__NR_mmap, (unsigned long)addr, len, prot, flags,
-			fd, offset);
+	return syscall1(__NR_exit, error_code);
 }
 
-static unsigned long __used sys_munmap(void *addr, size_t len)
+static int __used sys_getsockname(int fd, struct sockaddr *addr,
+				  socklen_t *addrlen)
 {
-	return syscall2(__NR_munmap, (unsigned long)addr, len);
+	int len = *addrlen, ret;
+
+	ret = syscall3(__NR_getsockname, fd, (unsigned long)addr,
+		       (unsigned long)&len);
+	*addrlen = len;
+	return ret;
+}
+
+static int __used sys_getpeername(int fd, struct sockaddr *addr,
+				  socklen_t *addrlen)
+{
+	int len = *addrlen, ret;
+
+	ret = syscall3(__NR_getpeername, fd, (unsigned long)addr,
+		       (unsigned long)&len);
+	*addrlen = len;
+	return ret;
+}
+
+static long __used sys_gettid(void)
+{
+	return syscall0(__NR_gettid);
+}
+
+static time_t __used sys_time(void)
+{
+	return syscall0(__NR_time);
 }

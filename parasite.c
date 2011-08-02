@@ -1,3 +1,7 @@
+#include <inttypes.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+
 #include "parasite.h"
 #include "syscall.h"
 
@@ -37,6 +41,59 @@ static void print_msg(const char *msg)
 	for (sz = 0; msg[sz] != '\0'; sz++)
 		;
 	sys_write(1, msg, sz);
+}
+
+static int get_sockinfo(int fd, struct psockinfo *si, const char **emsg)
+{
+	struct sockaddr_in sin;
+	socklen_t slen;
+	int ret;
+
+	slen = sizeof(sin);
+	if ((ret = sys_getsockname(fd, (struct sockaddr *)&sin, &slen))) {
+		*emsg = "getsockname";
+		return ret;
+	}
+	if (slen != sizeof(sin) || sin.sin_family != AF_INET) {
+		*emsg = "getsockname invalid";
+		return -EINVAL;
+	}
+	si->local_ip = sin.sin_addr.s_addr;
+	si->local_port = sin.sin_port;
+
+	slen = sizeof(sin);
+	if ((ret = sys_getpeername(fd, (struct sockaddr *)&sin, &slen))) {
+		*emsg = "getpeername";
+		return ret;
+	}
+	if (slen != sizeof(sin) || sin.sin_family != AF_INET) {
+		*emsg = "getpeername invalid";
+		return -EINVAL;
+	}
+	si->remote_ip = sin.sin_addr.s_addr;
+	si->remote_port = sin.sin_port;
+
+	if ((ret = sys_ioctl(fd, SIOCGINSEQ, (unsigned long)&si->in_seq))) {
+		*emsg = "SIOCGINSEQ";
+		return ret;
+	}
+
+	if ((ret = sys_ioctl(fd, SIOCGOUTSEQ, (unsigned long)&si->out_seq))) {
+		*emsg = "SIOCGOUTSEQ";
+		return ret;
+	}
+
+	if ((ret = sys_ioctl(fd, SIOCINQ, (unsigned long)&si->in_qsz))) {
+		*emsg = "SIOCINQ";
+		return ret;
+	}
+
+	if ((ret = sys_ioctl(fd, SIOCOUTQ, (unsigned long)&si->out_qsz))) {
+		*emsg = "SIOCOUTQ";
+		return ret;
+	}
+
+	return 0;
 }
 
 static void __attribute__((used)) parasite(int cmd_port)
@@ -99,6 +156,10 @@ static void __attribute__((used)) parasite(int cmd_port)
 			break;
 		case PCMD_QUIT:
 			quit = 1;
+			break;
+		case PCMD_SOCKINFO:
+			ret = get_sockinfo(arg0, (void *)data, &emsg);
+			cmd.data_len = sizeof(struct psockinfo);
 			break;
 		}
 

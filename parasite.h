@@ -16,6 +16,20 @@ struct parasite_cmd {
 enum {
 	PCMD_SAY,	/* @data is the string to pring */
 	PCMD_QUIT,	/* tell parasite to die */
+	PCMD_SOCKINFO,	/* @arg0 is fd, returns struct psockinfo */
+	PCMD_PEEK_INQ,	/* @arg0 is fd, @arg1 bytes to peek */
+	PCMD_PEEK_OUTQ,	/* @arg0 is fd, @arg1 bytes to peek */
+};
+
+struct psockinfo {
+	uint32_t	local_ip;
+	uint32_t	remote_ip;
+	uint16_t	local_port;
+	uint16_t	remote_port;
+	uint32_t	in_seq;
+	uint32_t	out_seq;
+	uint32_t	in_qsz;
+	uint32_t	out_qsz;
 };
 
 #endif
