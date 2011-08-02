@@ -1,0 +1,4 @@
+#!/bin/bash
+
+iptables -F INPUT
+iptables -F OUTPUT

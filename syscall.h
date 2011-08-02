@@ -105,12 +105,15 @@ static long __used syscall6(int nr, unsigned long arg0, unsigned long arg1,
 #define __NR_mmap		9
 #define __NR_munmap		11
 #define __NR_ioctl		16
+#define __NR_dup2		33
 #define __NR_socket		41
 #define __NR_connect		42
 #define __NR_sendmsg		46
 #define __NR_recvmsg		47
 #define __NR_getsockname	51
 #define __NR_getpeername	52
+#define __NR_setsockopt		54
+
 #define __NR_exit		60
 #define __NR_gettid		186
 #define __NR_time		201
@@ -147,6 +150,11 @@ static int __used sys_ioctl(int fd, int req, void *arg)
 	return syscall3(__NR_ioctl, fd, req, (unsigned long)arg);
 }
 
+static int __used sys_dup2(int ofd, int nfd)
+{
+	return syscall2(__NR_dup2, ofd, nfd);
+}
+
 static int __used sys_socket(int family, int type, int protocol)
 {
 	return syscall3(__NR_socket, family, type, protocol);
@@ -165,11 +173,6 @@ static ssize_t __used sys_sendmsg(int fd, const struct msghdr *msg, int flags)
 static ssize_t __used sys_recvmsg(int fd, struct msghdr *msg, int flags)
 {
 	return syscall3(__NR_recvmsg, fd, (unsigned long)msg, flags);
-}
-
-static int __used sys_exit(int error_code)
-{
-	return syscall1(__NR_exit, error_code);
 }
 
 static int __used sys_getsockname(int fd, struct sockaddr *addr,
@@ -192,6 +195,18 @@ static int __used sys_getpeername(int fd, struct sockaddr *addr,
 		       (unsigned long)&len);
 	*addrlen = len;
 	return ret;
+}
+
+static int __used sys_setsockopt(int fd, int level, int optname,
+				 char *optval, int optlen)
+{
+	return syscall5(__NR_setsockopt, fd, level, optname,
+			(unsigned long)optval, optlen);
+}
+
+static int __used sys_exit(int error_code)
+{
+	return syscall1(__NR_exit, error_code);
 }
 
 static long __used sys_gettid(void)

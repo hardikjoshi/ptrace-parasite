@@ -19,6 +19,7 @@ enum {
 	PCMD_SOCKINFO,	/* @arg0 is fd, returns struct psockinfo */
 	PCMD_PEEK_INQ,	/* @arg0 is fd, @arg1 bytes to peek */
 	PCMD_PEEK_OUTQ,	/* @arg0 is fd, @arg1 bytes to peek */
+	PCMD_DUP_CSOCK,	/* @arg0 is fd to dup over w/ cmd socket */
 };
 
 struct psockinfo {

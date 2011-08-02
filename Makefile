@@ -1,7 +1,7 @@
 all: parasite simple-host net-host
 
 parasite: main.c parasite-blob.h parasite.h
-	gcc -Wall -o parasite main.c
+	gcc -Wall -o parasite main.c -lnetfilter_queue
 
 parasite-blob.h: parasite.c parasite.lds parasite.h
 	gcc -Wall -fpic -c parasite.c

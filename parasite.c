@@ -158,13 +158,16 @@ static void __attribute__((used)) parasite(int cmd_port)
 			print_msg("PARASITE SAY: ");
 			sys_write(arg0, data, data_len);
 			break;
+
 		case PCMD_QUIT:
 			quit = 1;
 			break;
+
 		case PCMD_SOCKINFO:
 			ret = get_sockinfo(arg0, (void *)data);
 			cmd.data_len = sizeof(struct psockinfo);
 			break;
+
 		case PCMD_PEEK_INQ: {
 			struct iovec iov = { .iov_base = data, .iov_len = arg1 };
 			struct msghdr mh = { .msg_iov = &iov, .msg_iovlen = 1 };
@@ -173,11 +176,26 @@ static void __attribute__((used)) parasite(int cmd_port)
 			cmd.data_len = ret > 0 ? ret : 0;
 			break;
 		}
+
 		case PCMD_PEEK_OUTQ:
 			*(volatile uint32_t *)data = arg1;
 			ret = sys_ioctl(arg0, SIOCPEEKOUTQ, data);
 			cmd.data_len = ret > 0 ? ret : 0;
 			break;
+
+		case PCMD_DUP_CSOCK: {
+			struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+
+			/* try to set LINGER */
+			ret = sys_setsockopt(arg0, SOL_SOCKET, SO_LINGER,
+					     &lg, sizeof(lg));
+			if (ret)
+				print_msg("PARASITE SO_LINGER failed\n");
+
+			ret = sys_dup2(sock, arg0);
+			break;
+		}
+
 		default:
 			print_msg("PARASITE unknown command ");
 			print_msg(long_to_str(opcode));

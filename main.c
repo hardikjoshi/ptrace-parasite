@@ -20,6 +20,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <linux/netfilter.h>
+#include <libnetfilter_queue/libnetfilter_queue.h>
 
 #include "parasite.h"
 
@@ -31,11 +33,17 @@
 
 #define PTRACE_EVENT_STOP	7
 
-#define MAX_THREADS	1024
+#define NFQ_NR			3942
+#define MAX_THREADS		1024
+
 static pid_t tids[MAX_THREADS];
 static int nr_threads;
-static int listen_sock, pcmd_port;
+static int listen_sock, pcmd_port, pcmd_sock;
 static int target_sock_fd = -1;
+static char *in_buf, *out_buf;
+struct psockinfo psockinfo;
+static struct nfq_handle *nfq_h;
+static struct nfq_q_handle *nfq_qh;
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
 #define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
@@ -316,56 +324,61 @@ static long parasite_cmd(int sock, int opcode,
 static void parasite_sequencer(void)
 {
 	const char hello[] = "ah ah! mic test!\n";
+	struct psockinfo *si = &psockinfo;
 	unsigned long data_len;
-	int sock, ret;
-	struct psockinfo si;
 	unsigned long len;
 	struct in_addr lin, rin;
 	char lstr[INET_ADDRSTRLEN], rstr[INET_ADDRSTRLEN];
-	char *in_buf = NULL, *out_buf = NULL;
+	int ret;
 
 	printf("waiting for connection...");
 	fflush(stdout);
-	assert((sock = accept(listen_sock, NULL, NULL)) >= 0);
+	assert((pcmd_sock = accept(listen_sock, NULL, NULL)) >= 0);
 	printf(" connected\n");
 
 	data_len = sizeof(hello);
-	assert(!parasite_cmd(sock, PCMD_SAY, 0, 0, (void *)hello, &data_len));
+	assert(!parasite_cmd(pcmd_sock, PCMD_SAY, 0, 0,
+			     (void *)hello, &data_len));
 
 	if (target_sock_fd < 0)
 		goto exit;
 
 	len = 0;
-	assert(!parasite_cmd(sock, PCMD_SOCKINFO, target_sock_fd, 0, &si, &len));
+	assert(!parasite_cmd(pcmd_sock, PCMD_SOCKINFO,
+			     target_sock_fd, 0, si, &len));
 
-	lin.s_addr = si.local_ip;
-	rin.s_addr = si.remote_ip;
+	lin.s_addr = si->local_ip;
+	rin.s_addr = si->remote_ip;
 
 	printf("target socket: %s:%d -> %s:%d in %u@%#08x out %u@%#08x\n",
-	       inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si.local_port),
-	       inet_ntop(AF_INET, &rin, lstr, sizeof(rstr)), ntohs(si.remote_port),
-	       si.in_qsz, si.in_seq, si.out_qsz, si.out_seq);
+	       inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
+	       inet_ntop(AF_INET, &rin, lstr, sizeof(rstr)), ntohs(si->remote_port),
+	       si->in_qsz, si->in_seq, si->out_qsz, si->out_seq);
 
-	assert(si.in_qsz <= PCMD_MAX_DATA && si.out_qsz <= PCMD_MAX_DATA);
+	assert(si->in_qsz <= PCMD_MAX_DATA && si->out_qsz <= PCMD_MAX_DATA);
 
-	if (si.in_qsz) {
-		assert((in_buf = malloc(si.in_qsz)));
+	if (si->in_qsz) {
+		assert((in_buf = malloc(si->in_qsz)));
 		data_len = 0;
-		assert((ret = parasite_cmd(sock, PCMD_PEEK_INQ, target_sock_fd,
-					   si.in_qsz, in_buf, &data_len)) >= 0);
-		si.in_qsz = data_len;
+		assert((ret = parasite_cmd(pcmd_sock, PCMD_PEEK_INQ,
+					   target_sock_fd, si->in_qsz,
+					   in_buf, &data_len)) >= 0);
+		si->in_qsz = data_len;
 	}
-	if (si.out_qsz) {
-		assert((out_buf = malloc(si.out_qsz)));
+	if (si->out_qsz) {
+		assert((out_buf = malloc(si->out_qsz)));
 		data_len = 0;
-		assert((ret = parasite_cmd(sock, PCMD_PEEK_INQ, target_sock_fd,
-					   si.out_qsz, out_buf, &data_len)) >= 0);
-		si.out_qsz = data_len;
+		assert((ret = parasite_cmd(pcmd_sock, PCMD_PEEK_INQ,
+					   target_sock_fd, si->out_qsz,
+					   out_buf, &data_len)) >= 0);
+		si->out_qsz = data_len;
 	}
-	printf("peeked socket buffer in %d out %d\n", si.in_qsz, si.out_qsz);
+	printf("peeked socket buffer in %d out %d\n", si->in_qsz, si->out_qsz);
 
+	assert(parasite_cmd(pcmd_sock, PCMD_DUP_CSOCK,
+			    target_sock_fd, 0, NULL, NULL) >= 0);
 exit:
-	assert(!parasite_cmd(sock, PCMD_QUIT, 0, 0, NULL, NULL));
+	assert(!parasite_cmd(pcmd_sock, PCMD_QUIT, 0, 0, NULL, NULL));
 	free(in_buf);
 	free(out_buf);
 }
@@ -486,6 +499,18 @@ static void insert_parasite(pid_t tid)
 	free(saved_code);
 }
 
+static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
+		  struct nfq_data *nfa, void *data)
+{
+	uint32_t id = 0;
+	struct nfqnl_msg_packet_hdr *ph;
+
+	if ((ph = nfq_get_msg_packet_hdr(nfa)))
+		id = ntohl(ph->packet_id);
+
+	return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+}
+
 int main(int argc, char **argv)
 {
 	struct sockaddr_in in = { .sin_family = AF_INET,
@@ -493,7 +518,7 @@ int main(int argc, char **argv)
 				  .sin_port = 0, };
 	pid_t pid, tid;
 	socklen_t len;
-	int v;
+	int i, v;
 
 	if (argc < 2) {
 		fprintf(stderr, "Usage: parasite PID [sockfd]\n");
@@ -501,8 +526,13 @@ int main(int argc, char **argv)
 	}
 	pid = strtoul(argv[1], NULL, 0);
 
-	if (argc >= 3)
+	if (argc >= 3) {
 		target_sock_fd = strtoul(argv[2], NULL, 0);
+		assert((nfq_h = nfq_open()));
+		assert(!nfq_unbind_pf(nfq_h, AF_INET));
+		assert(!nfq_bind_pf(nfq_h, AF_INET));
+		assert((nfq_qh = nfq_create_queue(nfq_h, NFQ_NR, nfq_cb, NULL)));
+	}
 
 	/* verify signature at port offset in parasite blob */
 	memcpy(&v, parasite_blob + PCMD_PORT_OFFSET, sizeof(v));
@@ -525,5 +555,15 @@ int main(int argc, char **argv)
 	tid = tids[0];
 
 	insert_parasite(tid);
+
+	for (i = 0; i < nr_threads; i++)
+		assert(!ptrace(PTRACE_DETACH, tids[i], NULL, NULL));
+
+	if (target_sock_fd < 0)
+		return 0;
+
+	nfq_destroy_queue(nfq_qh);
+	nfq_close(nfq_h);
+
 	return 0;
 }
