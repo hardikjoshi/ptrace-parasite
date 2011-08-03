@@ -23,6 +23,10 @@
 #include <arpa/inet.h>
 #include <linux/netfilter.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
+#include <linux/ip.h>
+#include <net/if.h>
+#include <pthread.h>
+#include <fcntl.h>
 
 #include "parasite.h"
 
@@ -34,16 +38,17 @@
 
 #define PTRACE_EVENT_STOP	7
 
-#define SIOCSOUTSEQ	0x894E		/* set write_seq */
+#define SIOCSOUTSEQ		0x894E
 
 #define MAX_THREADS		1024
+#define MSS			1400
 
 static const char *setup_nfqueue_cmd = "./setup-nfqueue";
 static const char *flush_nfqueue_cmd = "./flush-nfqueue";
 
 static pid_t tids[MAX_THREADS];
 static int nr_threads;
-static int listen_sock, pcmd_port, pcmd_sock;
+static int listen_sock, pcmd_port, pcmd_sock, raw_sock;
 static int target_sock_fd = -1;
 static char *in_buf, *out_buf;
 struct psockinfo psockinfo;
@@ -52,10 +57,19 @@ static struct nfq_handle *pnfq_h;
 static struct nfq_q_handle *pnfq_qh;
 static int remote_sock;
 static char pnfq_buf[4096] __attribute__((aligned));
-static unsigned char *last_pkt;
-static int last_pkt_size;
-static int pnfq_cmd_drop_all;
-static uint32_t pnfq_cmd_wait_ack;
+
+enum {
+	PNFQ_WAIT_SYN,
+	PNFQ_WAIT_ACK,
+	PNFQ_DRAIN,
+};
+
+static int pnfq_cmd;
+static uint32_t pnfq_wait_ack_seq;
+static unsigned char waited_pkt[4096];
+static int waited_pkt_len;
+static struct iphdr *waited_iph;
+static struct tcphdr *waited_tcph;
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
 #define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
@@ -529,37 +543,117 @@ static void insert_parasite(pid_t tid)
 static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		   struct nfq_data *nfa, void *data)
 {
-	uint32_t id = 0;
+	uint32_t id = 0, done = 0;
+	int indev = nfq_get_indev(nfa);
+	unsigned char *pkt;
+	struct iphdr *iph;
+	struct tcphdr *tcph;
 	struct nfqnl_msg_packet_hdr *ph;
-	int ret;
+	int from_local, via_lo, size;
+	char ifname[IFNAMSIZ] = "";
 
 	if ((ph = nfq_get_msg_packet_hdr(nfa)))
 		id = ntohl(ph->packet_id);
 
-	ret = nfq_get_payload(nfa, &last_pkt);
-	last_pkt_size = min(ret, 0);
+	size = nfq_get_payload(nfa, &pkt);
+	if (size < sizeof(*iph)) {
+		printf("pkt: size=%d\n", size);
+		goto drop;
+	}
+	iph = (void *)pkt;
 
-	return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+	if (size < iph->ihl * 4 + sizeof(*tcph)) {
+		printf("pkt: short, size=%d ihl=%d\n", size, iph->ihl);
+		goto drop;
+	}
+	tcph = (void *)pkt + (iph->ihl * 4);
+
+	from_local = iph->saddr == psockinfo.local_ip;
+
+	via_lo = 0;
+	if (indev) {
+		if_indextoname(indev, ifname);
+		if (ifname[0] == 'l' && ifname[1] == 'o')
+			via_lo = 1;
+	}
+
+	switch (pnfq_cmd) {
+	case PNFQ_WAIT_SYN:
+		done = from_local && tcph->syn;
+		break;
+
+	case PNFQ_WAIT_ACK:
+		done = from_local && tcph->ack &&
+			ntohl(tcph->ack_seq) == pnfq_wait_ack_seq;
+		break;
+	}
+
+	if (!waited_pkt_len && done) {
+		memcpy(waited_pkt, pkt, size);
+		waited_pkt_len = size;
+		waited_iph = iph;
+		waited_tcph = tcph;
+	} else
+		done = 0;
+
+	printf("pkt: %s S %08x A %08x %s%s%s%s via %s %s\n",
+	       from_local ? "L->R" : "R->L",
+	       ntohl(tcph->seq), ntohl(tcph->ack_seq),
+	       tcph->ack ? "a" : "_", tcph->syn ? "s" : "_", 
+	       tcph->fin ? "f" : "_", tcph->rst ? "r" : "_",
+	       indev ? ifname : "--", done ? "DONE" : "");
+drop:
+	return nfq_set_verdict(qh, id, via_lo ? NF_ACCEPT : NF_DROP, 0, NULL);
 }
 
-static int pnfq_drop_all(void)
+static int pnfq_wait_pkt(int cmd, uint32_t seq)
 {
 	int fd = nfq_fd(pnfq_h);
 	int ret, cnt = 0;
 
-	pnfq_cmd_drop_all = 1;
+	pnfq_cmd = cmd;
+	pnfq_wait_ack_seq = seq;
+	waited_pkt_len = 0;
 
-	while (1) {
-		ret = recv(fd, pnfq_buf, sizeof(pnfq_buf), MSG_DONTWAIT);
+	do {
+		ret = recv(fd, pnfq_buf, sizeof(pnfq_buf),
+			   cmd == PNFQ_DRAIN ? MSG_DONTWAIT : 0);
 		if (ret < 0 && errno == EAGAIN)
 			break;
 		assert(ret > 0);
 		nfq_handle_packet(pnfq_h, pnfq_buf, ret);
 		cnt++;
+	} while (!waited_pkt_len);
+
+	return cnt;
+}
+
+uint16_t tcp_csum(uint32_t saddr, uint32_t daddr, void *data, int len)
+{
+	uint8_t *p = data;
+	uint16_t *sap = (void *)&saddr;
+	uint16_t *dap = (void *)&daddr;
+	uint32_t sum = 0;
+	int i;
+
+	sum += ntohs(sap[0]);
+	sum += ntohs(sap[1]);
+	sum += ntohs(dap[0]);
+	sum += ntohs(dap[1]);
+	sum += len;
+	sum += IPPROTO_TCP;
+
+	for (i = 0; i < len; i += 2) {
+		unsigned int hb = p[i];
+		unsigned int lb = i + 1 < len ? p[i + 1] : 0;
+
+		sum += hb << 8 | lb;
 	}
 
-	pnfq_cmd_drop_all = 0;
-	return cnt;
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum += sum >> 16;
+	sum = ~sum;
+	return htons(sum);
 }
 
 static void restore_connection(void)
@@ -571,23 +665,110 @@ static void restore_connection(void)
 	struct sockaddr_in rsin = { .sin_family = AF_INET,
 				    .sin_addr.s_addr = si->remote_ip,
 				    .sin_port = si->remote_port, };
-	uint32_t seq;
-	int sock;
+	uint32_t lseq = si->out_seq - si->out_qsz - 1;	/* -1 for SYN */
+	uint32_t rseq = si->in_seq - si->in_qsz - 1;	/* ditto */
+	uint8_t data_pkt[4096];
+	struct iphdr *iph;
+	struct tcphdr *tcph;
+	const int hlen = sizeof(*iph) + sizeof(*tcph);
+	int sock, xfer;
 
-	pnfq_drop_all();
+	printf("restoring connection, connecting...\n");
 
 	assert((sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) >= 0);
 	assert(!bind(sock, (struct sockaddr *)&lsin, sizeof(lsin)));
-	seq = si->out_seq - si->out_qsz - 1;	/* 1 is for SYN */
-	assert(!ioctl(sock, SIOCSOUTSEQ, &seq));
+	assert(!ioctl(sock, SIOCSOUTSEQ, &lseq));
 	assert(connect(sock, (struct sockaddr *)&rsin, sizeof(rsin)) < 0 &&
 	       errno == EINPROGRESS);
+	lseq++;
 
-	pnfq_drop_all();
+	pnfq_wait_pkt(PNFQ_WAIT_SYN, 0);
+
+	printf("got SYN, replying with SYN/ACK\n");
+
+	iph = waited_iph;
+	tcph = waited_tcph;
+
+	assert(ntohl(tcph->seq) == lseq - 1);
+	iph->saddr = si->remote_ip;
+	iph->daddr = si->local_ip;
+	tcph->source = si->remote_port;
+	tcph->dest = si->local_port;
+	tcph->syn = 1;
+	tcph->ack = 1;
+	tcph->seq = htonl(rseq);
+	tcph->ack_seq = htonl(lseq);
+	tcph->check = 0;
+	tcph->check = tcp_csum(iph->saddr, iph->daddr, tcph, tcph->doff * 4);
+
+	assert(sendto(raw_sock, iph, ntohs(iph->tot_len), 0,
+		      (struct sockaddr *)&lsin, sizeof(lsin)) == ntohs(iph->tot_len));
+	rseq++;
+
+	memcpy(data_pkt, iph, hlen);
+
+	pnfq_wait_pkt(PNFQ_WAIT_ACK, rseq);
+
+	printf("connection established, repopulating rx/tx queues\n");
+
+	iph = (void *)data_pkt;
+	tcph = (void *)data_pkt + sizeof(*iph);
+	tcph->syn = 0;
+	tcph->doff = sizeof(*tcph) / 4;
+
+	xfer = 0;
+	while (xfer < si->in_qsz) {
+		int sz = min((int)si->in_qsz - xfer, MSS - hlen);
+
+		memcpy(data_pkt + hlen, in_buf + xfer, sz);
+
+		iph->tot_len = htons(hlen + sz);
+		tcph->seq = htonl(rseq);
+		tcph->ack_seq = htonl(lseq);
+		tcph->check = 0;
+		tcph->check = tcp_csum(iph->saddr, iph->daddr, tcph,
+				       sizeof(*tcph) + sz);
+
+		xfer += sz;
+		rseq += sz;
+
+		assert(sendto(raw_sock, iph, hlen + sz, 0,
+			      (struct sockaddr *)&lsin, sizeof(lsin)) == hlen + sz);
+		pnfq_wait_pkt(PNFQ_WAIT_ACK, rseq);
+	}
+
+	assert(send(sock, out_buf, si->out_qsz, 0) == si->out_qsz);
+
+	printf("connection restored\n");
 
 	flush_pnfq();
 
+	assert(!fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) & ~O_NONBLOCK));
 	remote_sock = sock;
+}
+
+static void *forward_thread_fn(void *arg)
+{
+	int dir = (long)arg;
+	int src = dir ? pcmd_sock : remote_sock;
+	int dst = dir ? remote_sock : pcmd_sock;
+	char buf[4096];
+	int sz, ret;
+
+	while (1) {
+		sz = recv(src, buf, sizeof(buf), 0);
+		if (sz <= 0)
+			break;
+		ret = send(dst, buf, sz, 0);
+		if (ret != sz)
+			break;
+	}
+
+	printf("shutting down %s -> %s\n",
+	       dir ? "local" : "remote", dir ? "remote" : "local");
+	shutdown(src, SHUT_RD);
+	shutdown(dst, SHUT_WR);
+	return NULL;
 }
 
 int main(int argc, char **argv)
@@ -598,6 +779,7 @@ int main(int argc, char **argv)
 	pid_t pid, tid;
 	socklen_t len;
 	int i, v;
+	pthread_t pth[2];
 
 	if (argc < 2) {
 		fprintf(stderr, "Usage: parasite PID [sockfd]\n");
@@ -610,8 +792,11 @@ int main(int argc, char **argv)
 		assert((pnfq_h = nfq_open()));
 		nfq_unbind_pf(pnfq_h, AF_INET);
 		assert(!nfq_bind_pf(pnfq_h, AF_INET));
-		assert((pnfq_qh = nfq_create_queue(pnfq_h, 0, &pnfq_cb, NULL)));
+		assert((pnfq_qh = nfq_create_queue(pnfq_h, 0, pnfq_cb, NULL)));
 		assert(!nfq_set_mode(pnfq_qh, NFQNL_COPY_PACKET, 0xffff));
+		assert((raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)) >= 0);
+		v = 1;
+		assert(!setsockopt(raw_sock, IPPROTO_IP, IP_HDRINCL, &v, sizeof(int)));
 	}
 	if (argc >= 4)
 		setup_nfqueue_cmd = argv[3];
@@ -651,6 +836,13 @@ int main(int argc, char **argv)
 
 	nfq_destroy_queue(pnfq_qh);
 	nfq_close(pnfq_h);
+
+	/* forward the data */
+	assert(!pthread_create(&pth[0], NULL, forward_thread_fn, (void *)(long)0));
+	assert(!pthread_create(&pth[1], NULL, forward_thread_fn, (void *)(long)1));
+
+	assert(!pthread_join(pth[0], NULL));
+	assert(!pthread_join(pth[1], NULL));
 
 	return 0;
 }
