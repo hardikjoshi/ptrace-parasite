@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -33,8 +34,12 @@
 
 #define PTRACE_EVENT_STOP	7
 
-#define NFQ_NR			3942
+#define SIOCSOUTSEQ	0x894E		/* set write_seq */
+
 #define MAX_THREADS		1024
+
+static const char *setup_nfqueue_cmd = "./setup-nfqueue";
+static const char *flush_nfqueue_cmd = "./flush-nfqueue";
 
 static pid_t tids[MAX_THREADS];
 static int nr_threads;
@@ -42,8 +47,15 @@ static int listen_sock, pcmd_port, pcmd_sock;
 static int target_sock_fd = -1;
 static char *in_buf, *out_buf;
 struct psockinfo psockinfo;
-static struct nfq_handle *nfq_h;
-static struct nfq_q_handle *nfq_qh;
+
+static struct nfq_handle *pnfq_h;
+static struct nfq_q_handle *pnfq_qh;
+static int remote_sock;
+static char pnfq_buf[4096] __attribute__((aligned));
+static unsigned char *last_pkt;
+static int last_pkt_size;
+static int pnfq_cmd_drop_all;
+static uint32_t pnfq_cmd_wait_ack;
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
 #define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
@@ -61,6 +73,30 @@ static struct nfq_q_handle *nfq_qh;
 	typeof(y) _max2 = (y);			\
 	(void) (&_max1 == &_max2);		\
 	_max1 > _max2 ? _max1 : _max2; })
+
+static void setup_pnfq(void)
+{
+	struct psockinfo *si = &psockinfo;
+	struct in_addr lin = { .s_addr = si->local_ip };
+	struct in_addr rin = { .s_addr = si->remote_ip };
+	char lstr[INET_ADDRSTRLEN], rstr[INET_ADDRSTRLEN];
+	char buf[512];
+
+	printf("target socket: %s:%d -> %s:%d in %u@%#08x out %u@%#08x\n",
+	       inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
+	       inet_ntop(AF_INET, &rin, rstr, sizeof(rstr)), ntohs(si->remote_port),
+	       si->in_qsz, si->in_seq, si->out_qsz, si->out_seq);
+
+	snprintf(buf, sizeof(buf), "%s %s:%d %s:%d", setup_nfqueue_cmd,
+		 inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
+		 inet_ntop(AF_INET, &rin, rstr, sizeof(rstr)), ntohs(si->remote_port));
+	assert(!system(buf));
+}
+
+static void flush_pnfq(void)
+{
+	assert(!system(flush_nfqueue_cmd));
+}
 
 /*
  * Naive and racy implementation for seizing all threads in a process.
@@ -327,8 +363,6 @@ static void parasite_sequencer(void)
 	struct psockinfo *si = &psockinfo;
 	unsigned long data_len;
 	unsigned long len;
-	struct in_addr lin, rin;
-	char lstr[INET_ADDRSTRLEN], rstr[INET_ADDRSTRLEN];
 	int ret;
 
 	printf("waiting for connection...");
@@ -346,16 +380,9 @@ static void parasite_sequencer(void)
 	len = 0;
 	assert(!parasite_cmd(pcmd_sock, PCMD_SOCKINFO,
 			     target_sock_fd, 0, si, &len));
-
-	lin.s_addr = si->local_ip;
-	rin.s_addr = si->remote_ip;
-
-	printf("target socket: %s:%d -> %s:%d in %u@%#08x out %u@%#08x\n",
-	       inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
-	       inet_ntop(AF_INET, &rin, lstr, sizeof(rstr)), ntohs(si->remote_port),
-	       si->in_qsz, si->in_seq, si->out_qsz, si->out_seq);
-
 	assert(si->in_qsz <= PCMD_MAX_DATA && si->out_qsz <= PCMD_MAX_DATA);
+
+	setup_pnfq();
 
 	if (si->in_qsz) {
 		assert((in_buf = malloc(si->in_qsz)));
@@ -499,23 +526,75 @@ static void insert_parasite(pid_t tid)
 	free(saved_code);
 }
 
-static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
-		  struct nfq_data *nfa, void *data)
+static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
+		   struct nfq_data *nfa, void *data)
 {
 	uint32_t id = 0;
 	struct nfqnl_msg_packet_hdr *ph;
+	int ret;
 
 	if ((ph = nfq_get_msg_packet_hdr(nfa)))
 		id = ntohl(ph->packet_id);
 
+	ret = nfq_get_payload(nfa, &last_pkt);
+	last_pkt_size = min(ret, 0);
+
 	return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+}
+
+static int pnfq_drop_all(void)
+{
+	int fd = nfq_fd(pnfq_h);
+	int ret, cnt = 0;
+
+	pnfq_cmd_drop_all = 1;
+
+	while (1) {
+		ret = recv(fd, pnfq_buf, sizeof(pnfq_buf), MSG_DONTWAIT);
+		if (ret < 0 && errno == EAGAIN)
+			break;
+		assert(ret > 0);
+		nfq_handle_packet(pnfq_h, pnfq_buf, ret);
+		cnt++;
+	}
+
+	pnfq_cmd_drop_all = 0;
+	return cnt;
+}
+
+static void restore_connection(void)
+{
+	struct psockinfo *si = &psockinfo;
+	struct sockaddr_in lsin = { .sin_family = AF_INET,
+				    .sin_addr.s_addr = si->local_ip,
+				    .sin_port = si->local_port, };
+	struct sockaddr_in rsin = { .sin_family = AF_INET,
+				    .sin_addr.s_addr = si->remote_ip,
+				    .sin_port = si->remote_port, };
+	uint32_t seq;
+	int sock;
+
+	pnfq_drop_all();
+
+	assert((sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) >= 0);
+	assert(!bind(sock, (struct sockaddr *)&lsin, sizeof(lsin)));
+	seq = si->out_seq - si->out_qsz - 1;	/* 1 is for SYN */
+	assert(!ioctl(sock, SIOCSOUTSEQ, &seq));
+	assert(connect(sock, (struct sockaddr *)&rsin, sizeof(rsin)) < 0 &&
+	       errno == EINPROGRESS);
+
+	pnfq_drop_all();
+
+	flush_pnfq();
+
+	remote_sock = sock;
 }
 
 int main(int argc, char **argv)
 {
-	struct sockaddr_in in = { .sin_family = AF_INET,
-				  .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-				  .sin_port = 0, };
+	struct sockaddr_in sin = { .sin_family = AF_INET,
+				   .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+				   .sin_port = 0, };
 	pid_t pid, tid;
 	socklen_t len;
 	int i, v;
@@ -528,11 +607,16 @@ int main(int argc, char **argv)
 
 	if (argc >= 3) {
 		target_sock_fd = strtoul(argv[2], NULL, 0);
-		assert((nfq_h = nfq_open()));
-		assert(!nfq_unbind_pf(nfq_h, AF_INET));
-		assert(!nfq_bind_pf(nfq_h, AF_INET));
-		assert((nfq_qh = nfq_create_queue(nfq_h, NFQ_NR, nfq_cb, NULL)));
+		assert((pnfq_h = nfq_open()));
+		nfq_unbind_pf(pnfq_h, AF_INET);
+		assert(!nfq_bind_pf(pnfq_h, AF_INET));
+		assert((pnfq_qh = nfq_create_queue(pnfq_h, 0, &pnfq_cb, NULL)));
+		assert(!nfq_set_mode(pnfq_qh, NFQNL_COPY_PACKET, 0xffff));
 	}
+	if (argc >= 4)
+		setup_nfqueue_cmd = argv[3];
+	if (argc >= 5)
+		flush_nfqueue_cmd = argv[4];
 
 	/* verify signature at port offset in parasite blob */
 	memcpy(&v, parasite_blob + PCMD_PORT_OFFSET, sizeof(v));
@@ -540,13 +624,13 @@ int main(int argc, char **argv)
 
 	/* create control socket and record port number in the parasite blob */
 	assert((listen_sock = socket(AF_INET, SOCK_STREAM, 0)) >= 0);
-	assert(!bind(listen_sock, (struct sockaddr *)&in, sizeof(in)));
+	assert(!bind(listen_sock, (struct sockaddr *)&sin, sizeof(sin)));
 	assert(!listen(listen_sock, 1));
 
-	len = sizeof(in);
-	assert(!getsockname(listen_sock, (struct sockaddr *)&in, &len));
-	assert(len == sizeof(in));
-	pcmd_port = in.sin_port;
+	len = sizeof(sin);
+	assert(!getsockname(listen_sock, (struct sockaddr *)&sin, &len));
+	assert(len == sizeof(sin));
+	pcmd_port = sin.sin_port;
 	memcpy(parasite_blob + PCMD_PORT_OFFSET, &pcmd_port, sizeof(pcmd_port));
 
 	/* seize and insert parasite */
@@ -562,8 +646,11 @@ int main(int argc, char **argv)
 	if (target_sock_fd < 0)
 		return 0;
 
-	nfq_destroy_queue(nfq_qh);
-	nfq_close(nfq_h);
+	/* restore remote connection */
+	restore_connection();
+
+	nfq_destroy_queue(pnfq_qh);
+	nfq_close(pnfq_h);
 
 	return 0;
 }

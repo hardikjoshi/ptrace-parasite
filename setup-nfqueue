@@ -1,8 +1,8 @@
 #!/bin/bash
 
-USAGE="Usage: setup-nfqueue LOCAL_IP:LOCAL_PORT REMOTE_IP:REMOTE_PORT QNR"
+USAGE="Usage: setup-nfqueue LOCAL_IP:LOCAL_PORT REMOTE_IP:REMOTE_PORT"
 
-if [ $# -ne 3 ]; then
+if [ $# -ne 2 ]; then
     echo $USAGE 2>&1
     exit 1
 fi
@@ -11,9 +11,6 @@ LIP=${1%:*}
 LPORT=${1#*:}
 RIP=${2%:*}
 RPORT=${2#*:}
-QNR=$3
 
-iptables -I INPUT 1 -s $RIP -d $LIP -p tcp --sport $RPORT --dport $LPORT \
-	-j NFQUEUE --queue-num $QNR
-iptables -I OUTPUT 1 -s $LIP -d $RIP -p tcp --sport $LPORT --dport $RPORT \
-	-j NFQUEUE --queue-num $QNR
+iptables -I INPUT 1 -s $RIP -d $LIP -p tcp --sport $RPORT --dport $LPORT -j QUEUE
+iptables -I OUTPUT 1 -s $LIP -d $RIP -p tcp --sport $LPORT --dport $RPORT -j QUEUE
