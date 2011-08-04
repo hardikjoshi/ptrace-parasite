@@ -188,7 +188,7 @@ static void __attribute__((used)) parasite(int cmd_port)
 
 			/* try to set LINGER */
 			ret = sys_setsockopt(arg0, SOL_SOCKET, SO_LINGER,
-					     &lg, sizeof(lg));
+					     (void *)&lg, sizeof(lg));
 			if (ret)
 				print_msg("PARASITE SO_LINGER failed\n");
 

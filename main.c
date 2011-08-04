@@ -394,9 +394,13 @@ static void parasite_sequencer(void)
 	len = 0;
 	assert(!parasite_cmd(pcmd_sock, PCMD_SOCKINFO,
 			     target_sock_fd, 0, si, &len));
-	assert(si->in_qsz <= PCMD_MAX_DATA && si->out_qsz <= PCMD_MAX_DATA);
 
 	setup_pnfq();
+
+	len = 0;
+	assert(!parasite_cmd(pcmd_sock, PCMD_SOCKINFO,
+			     target_sock_fd, 0, si, &len));
+	assert(si->in_qsz <= PCMD_MAX_DATA && si->out_qsz <= PCMD_MAX_DATA);
 
 	if (si->in_qsz) {
 		assert((in_buf = malloc(si->in_qsz)));
@@ -409,7 +413,7 @@ static void parasite_sequencer(void)
 	if (si->out_qsz) {
 		assert((out_buf = malloc(si->out_qsz)));
 		data_len = 0;
-		assert((ret = parasite_cmd(pcmd_sock, PCMD_PEEK_INQ,
+		assert((ret = parasite_cmd(pcmd_sock, PCMD_PEEK_OUTQ,
 					   target_sock_fd, si->out_qsz,
 					   out_buf, &data_len)) >= 0);
 		si->out_qsz = data_len;
@@ -420,8 +424,6 @@ static void parasite_sequencer(void)
 			    target_sock_fd, 0, NULL, NULL) >= 0);
 exit:
 	assert(!parasite_cmd(pcmd_sock, PCMD_QUIT, 0, 0, NULL, NULL));
-	free(in_buf);
-	free(out_buf);
 }
 
 static void insert_parasite(pid_t tid)
@@ -666,12 +668,12 @@ static void restore_connection(void)
 				    .sin_addr.s_addr = si->remote_ip,
 				    .sin_port = si->remote_port, };
 	uint32_t lseq = si->out_seq - si->out_qsz - 1;	/* -1 for SYN */
-	uint32_t rseq = si->in_seq - si->in_qsz - 1;	/* ditto */
+	uint32_t rseq = si->in_seq - 1;			/* ditto */
 	uint8_t data_pkt[4096];
 	struct iphdr *iph;
 	struct tcphdr *tcph;
 	const int hlen = sizeof(*iph) + sizeof(*tcph);
-	int sock, xfer;
+	int sock, xfer, v;
 
 	printf("restoring connection, connecting...\n");
 
@@ -698,6 +700,7 @@ static void restore_connection(void)
 	tcph->ack = 1;
 	tcph->seq = htonl(rseq);
 	tcph->ack_seq = htonl(lseq);
+	tcph->window = htons(0xffff);
 	tcph->check = 0;
 	tcph->check = tcp_csum(iph->saddr, iph->daddr, tcph, tcph->doff * 4);
 
@@ -710,6 +713,9 @@ static void restore_connection(void)
 	pnfq_wait_pkt(PNFQ_WAIT_ACK, rseq);
 
 	printf("connection established, repopulating rx/tx queues\n");
+
+	v = si->in_qsz;
+	assert(!setsockopt(sock, SOL_SOCKET, SO_RCVBUFFORCE, &v, sizeof(v)));
 
 	iph = (void *)data_pkt;
 	tcph = (void *)data_pkt + sizeof(*iph);
@@ -737,6 +743,8 @@ static void restore_connection(void)
 		pnfq_wait_pkt(PNFQ_WAIT_ACK, rseq);
 	}
 
+	v = si->out_qsz;
+	assert(!setsockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, &v, sizeof(v)));
 	assert(send(sock, out_buf, si->out_qsz, 0) == si->out_qsz);
 
 	printf("connection restored\n");

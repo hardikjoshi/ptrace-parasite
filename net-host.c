@@ -20,14 +20,14 @@
 #define SIOCPEEKOUTQ	0x894F		/* peek output queue */
 
 static const struct timespec ts1ms = { .tv_nsec = 1000000 };
-static const char *contaminant = NULL;
+static uint64_t contaminant = 0;
 static int do_peek_outq;
 
 static void sigaction_handler(int signo, siginfo_t *si, void *uctx)
 {
 	printf("signal %d si_code=%#x\n", signo, si->si_code);
 	if (signo == SIGUSR1)
-		contaminant = "deadbeef";
+		contaminant = 0xdeadbeefbeefdeadLLU;
 	else
 		do_peek_outq = 1;
 }
@@ -88,8 +88,8 @@ static void *send_thread_fn(void *arg)
 		} else {
 			printf("inserting contaminant @%#08llx\n",
 			       (unsigned long long)cur);
-			memcpy(&buf, contaminant, sizeof(buf));
-			contaminant = NULL;
+			buf = htobe64(contaminant);
+			contaminant = 0;
 		}
 		assert(send(sock, &buf, sizeof(buf), 0) == sizeof(buf));
 	}
@@ -103,12 +103,11 @@ int main(int argc, char **argv)
 	struct sockaddr_in in = { .sin_family = AF_INET,
 				  .sin_addr.s_addr = INADDR_ANY };
 	unsigned long rx_kbps = 128;
-	uint64_t next = 0, timestamp;
-	struct timeval tv;
+	uint64_t next = 0;
 	socklen_t slen;
 	pthread_t pth;
 	char *p;
-	int i, sock;
+	int i, v, sock;
 
 	if (argc < 2 || argc > 3) {
 		fprintf(stderr, "Usage: net-host [IP:]PORT [RX_KPBS]\n");
@@ -131,6 +130,9 @@ int main(int argc, char **argv)
 
 	assert((sock = socket(AF_INET, SOCK_STREAM, 0)) >= 0);
 
+	v = 1;
+	assert(!setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &v, sizeof(v)));
+
 	if (in.sin_addr.s_addr != INADDR_ANY) {
 		assert(!connect(sock, (struct sockaddr *)&in, sizeof(in)));
 	} else {
@@ -149,29 +151,17 @@ int main(int argc, char **argv)
 
 	assert(!pthread_create(&pth, NULL, send_thread_fn, (void *)(long)sock));
 
-	assert(!gettimeofday(&tv, NULL));
-	timestamp = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
-
 	while (1) {
-		uint64_t now, buf;
-		char cbuf[sizeof(buf) + 1] = "";
-		int usecs, cnt;
-
-		assert(!gettimeofday(&tv, NULL));
-		now = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
-		usecs = now - timestamp ?: 1;
-		usecs = usecs <= 0 || usecs > 1000000 ? 1000000 : usecs;
-		timestamp = now;
-
-		cnt = (usecs * rx_kbps) / 64 / 1000 ?: 1;
+		uint64_t buf;
+		int cnt = rx_kbps / 64 ?: 1;
 
 		for (i = 0; i < cnt; i++) {
 			assert(recv(sock, &buf, sizeof(buf), MSG_WAITALL) ==
 			       sizeof(buf));
 			if (be64toh(buf) != next) {
-				memcpy(cbuf, &buf, sizeof(buf));
-				printf("foreign data @%#08llx : \"%s\"\n",
-				       (unsigned long long)next, cbuf);
+				printf("foreign data @%#08llx : %#08llx\n",
+				       (unsigned long long)next,
+				       (unsigned long long)be64toh(buf));
 				continue;
 			}
 			next++;
