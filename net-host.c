@@ -90,8 +90,11 @@ static void *send_thread_fn(void *arg)
 {
 	int sock = (long)arg;
 	uint64_t cur = 0, buf;
+	int ret;
 
 	while (1) {
+		int bytes = 0;
+
 		if (do_peek_outq) {
 			peek_outq(sock, cur);
 			do_peek_outq = 0;
@@ -105,7 +108,13 @@ static void *send_thread_fn(void *arg)
 			buf = htobe64(contaminant);
 			contaminant = 0;
 		}
-		assert(send(sock, &buf, sizeof(buf), 0) == sizeof(buf));
+
+		while (bytes < sizeof(buf)) {
+			ret = send(sock, (void *)&buf + bytes,
+				   sizeof(buf) - bytes, 0);
+			bytes += ret;
+			assert(ret > 0 && bytes <= sizeof(buf));
+		}
 	}
 	return NULL;
 }
@@ -113,7 +122,7 @@ static void *send_thread_fn(void *arg)
 int main(int argc, char **argv)
 {
 	struct sigaction sa = { .sa_sigaction = sigaction_handler,
-				.sa_flags = SA_SIGINFO };
+				.sa_flags = SA_SIGINFO | SA_RESTART };
 	struct sockaddr_in in = { .sin_family = AF_INET,
 				  .sin_addr.s_addr = INADDR_ANY };
 	unsigned long rx_kbps = 128;
@@ -121,7 +130,7 @@ int main(int argc, char **argv)
 	socklen_t slen;
 	pthread_t pth;
 	char *p;
-	int i, v, sock;
+	int i, ret, v, sock;
 
 	if (argc < 2 || argc > 3) {
 		fprintf(stderr, "Usage: net-host [IP:]PORT [RX_KPBS]\n");
@@ -170,8 +179,15 @@ int main(int argc, char **argv)
 		int cnt = rx_kbps / 64 ?: 1;
 
 		for (i = 0; i < cnt; i++) {
-			assert(recv(sock, &buf, sizeof(buf), MSG_WAITALL) ==
-			       sizeof(buf));
+			int bytes = 0;
+
+			while (bytes < sizeof(buf)) {
+				ret = recv(sock, (void *)&buf + bytes,
+					   sizeof(buf) - bytes, 0);
+				bytes += ret;
+				assert(ret > 0 && bytes <= sizeof(buf));
+			}
+
 			if (be64toh(buf) != next) {
 				printf("foreign data @%#08llx : %#08llx\n",
 				       (unsigned long long)next,
