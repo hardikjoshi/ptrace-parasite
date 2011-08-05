@@ -32,8 +32,7 @@
 #include <linux/netfilter.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
-#include "parasite.h"
-
+/* kernel constants which aren't in libc yet */
 #define PTRACE_SEIZE		0x4206
 #define PTRACE_INTERRUPT	0x4207
 #define PTRACE_LISTEN		0x4208
@@ -44,31 +43,41 @@
 
 #define SIOCSOUTSEQ		0x894E
 
+/* params pulled out of my ass */
 #define MAX_THREADS		1024
 #define MSS			1400
 
+/* this defines the protocol to talk to parasite */
+#include "parasite.h"
+
+/* for ptracing the target process and talking to the parasite */
+static pid_t tids[MAX_THREADS];
+static int nr_threads;
+static int listen_sock, pcmd_port, pcmd_sock;
+
+/* for TCP connection hijacking */
+static int target_sock_fd = -1;
+static int raw_sock, remote_sock;
+struct psockinfo psockinfo;
+static char *in_buf, *out_buf;
+
+/* parasite nfqueue stuff */
 static const char setup_pnfq_cmd_base[] = "setup-nfqueue";
 static const char flush_pnfq_cmd_base[] = "flush-nfqueue";
 static char setup_pnfq_cmd[PATH_MAX];
 static char flush_pnfq_cmd[PATH_MAX];
 
-static pid_t tids[MAX_THREADS];
-static int nr_threads;
-static int listen_sock, pcmd_port, pcmd_sock, raw_sock;
-static int target_sock_fd = -1;
-static char *in_buf, *out_buf;
-struct psockinfo psockinfo;
-
 static struct nfq_handle *pnfq_h;
 static struct nfq_q_handle *pnfq_qh;
-static int remote_sock;
 static char pnfq_buf[4096] __attribute__((aligned));
 
+/* commands for pnfq_wait_pkt() */
 enum {
 	PNFQ_WAIT_SYN,		/* wait SYN from local */
 	PNFQ_WAIT_ACK,		/* wait ACK of certain seq from local */
 };
 
+/* for pnfq packet diddling */
 static int pnfq_cmd;
 static uint32_t pnfq_wait_ack_seq;
 static unsigned char waited_pkt[4096];
@@ -92,30 +101,6 @@ static struct tcphdr *waited_tcph;
 	typeof(y) _max2 = (y);			\
 	(void) (&_max1 == &_max2);		\
 	_max1 > _max2 ? _max1 : _max2; })
-
-static void setup_pnfq(void)
-{
-	struct psockinfo *si = &psockinfo;
-	struct in_addr lin = { .s_addr = si->local_ip };
-	struct in_addr rin = { .s_addr = si->remote_ip };
-	char lstr[INET_ADDRSTRLEN], rstr[INET_ADDRSTRLEN];
-	char buf[512];
-
-	printf("target socket: %s:%d -> %s:%d in %u@%#08x out %u@%#08x\n",
-	       inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
-	       inet_ntop(AF_INET, &rin, rstr, sizeof(rstr)), ntohs(si->remote_port),
-	       si->in_qsz, si->in_seq, si->out_qsz, si->out_seq);
-
-	snprintf(buf, sizeof(buf), "%s %s:%d %s:%d", setup_pnfq_cmd,
-		 inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
-		 inet_ntop(AF_INET, &rin, rstr, sizeof(rstr)), ntohs(si->remote_port));
-	assert(!system(buf));
-}
-
-static void flush_pnfq(void)
-{
-	assert(!system(flush_pnfq_cmd));
-}
 
 /*
  * Naive and racy implementation for seizing all threads in a process.
@@ -378,6 +363,30 @@ static long parasite_cmd(int sock, int opcode,
 		}
 	}
 	return cmd.opcode;
+}
+
+static void setup_pnfq(void)
+{
+	struct psockinfo *si = &psockinfo;
+	struct in_addr lin = { .s_addr = si->local_ip };
+	struct in_addr rin = { .s_addr = si->remote_ip };
+	char lstr[INET_ADDRSTRLEN], rstr[INET_ADDRSTRLEN];
+	char buf[512];
+
+	printf("target socket: %s:%d -> %s:%d in %u@%#08x out %u@%#08x\n",
+	       inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
+	       inet_ntop(AF_INET, &rin, rstr, sizeof(rstr)), ntohs(si->remote_port),
+	       si->in_qsz, si->in_seq, si->out_qsz, si->out_seq);
+
+	snprintf(buf, sizeof(buf), "%s %s:%d %s:%d", setup_pnfq_cmd,
+		 inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
+		 inet_ntop(AF_INET, &rin, rstr, sizeof(rstr)), ntohs(si->remote_port));
+	assert(!system(buf));
+}
+
+static void flush_pnfq(void)
+{
+	assert(!system(flush_pnfq_cmd));
 }
 
 static void parasite_sequencer(void)
