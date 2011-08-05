@@ -3,8 +3,8 @@
 
 #include <inttypes.h>
 
-#define PCMD_PORT_OFFSET		64
-#define PCMD_MAX_DATA			(8 << 20)
+#define PCMD_PORT_OFFSET	64
+#define PCMD_MAX_DATA		(8 << 20)
 
 struct parasite_cmd {
 	long		opcode;
@@ -14,12 +14,12 @@ struct parasite_cmd {
 };
 
 enum {
-	PCMD_SAY,	/* @data is the string to pring */
-	PCMD_QUIT,	/* tell parasite to die */
-	PCMD_SOCKINFO,	/* @arg0 is fd, returns struct psockinfo */
-	PCMD_PEEK_INQ,	/* @arg0 is fd, @arg1 bytes to peek */
-	PCMD_PEEK_OUTQ,	/* @arg0 is fd, @arg1 bytes to peek */
-	PCMD_DUP_CSOCK,	/* @arg0 is fd to dup over w/ cmd socket */
+	PCMD_SAY,		/* @data is the string to pring */
+	PCMD_QUIT,		/* tell parasite to die */
+	PCMD_SOCKINFO,		/* @arg0 is fd, returns struct psockinfo */
+	PCMD_PEEK_INQ,		/* @arg0 is fd, @arg1 bytes to peek */
+	PCMD_PEEK_OUTQ,		/* @arg0 is fd, @arg1 bytes to peek */
+	PCMD_DUP_CSOCK,		/* @arg0 is fd to dup over w/ cmd socket */
 };
 
 struct psockinfo {

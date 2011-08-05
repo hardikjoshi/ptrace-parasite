@@ -115,6 +115,7 @@ static void __attribute__((used)) parasite(int cmd_port)
 	int sock = -1;
 	long ret;
 
+	/* say hi, prepare data buffer and connect to mothership */
 	print_msg("PARASITE STARTED\n");
 
 	ret = sys_mmap(NULL, PCMD_MAX_DATA, PROT_READ | PROT_WRITE,
@@ -137,12 +138,17 @@ static void __attribute__((used)) parasite(int cmd_port)
 		goto exit;
 	}
 
+	/* receive instructions from mothership and execute them */
 	while ((ret = sys_recvmsg(sock, &cmd_mh, MSG_WAITALL)) == sizeof(cmd)) {
 		long opcode = cmd.opcode;
 		unsigned long arg0 = cmd.arg0, arg1 = cmd.arg1;
 		unsigned long data_len = cmd.data_len;
 		int quit = 0;
 
+		/*
+		 * Command info is available through the above variables.
+		 * @cmd is cleared and used for response data from now on.
+		 */
 		cmd = (struct parasite_cmd){};
 
 		data_iov.iov_len = data_len;

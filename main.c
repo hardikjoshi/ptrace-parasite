@@ -1,10 +1,13 @@
 #define _GNU_SOURCE
 
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/ptrace.h>
-#include <sys/wait.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -12,21 +15,22 @@
 #include <errno.h>
 #include <wait.h>
 #include <assert.h>
-#include <sys/user.h>
-#include <sys/mman.h>
 #include <signal.h>
 #include <sched.h>
 #include <time.h>
+#include <fcntl.h>
 #include <string.h>
+#include <pthread.h>
+#include <libgen.h>
+
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+
 #include <arpa/inet.h>
+#include <linux/ip.h>
 #include <linux/netfilter.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
-#include <linux/ip.h>
-#include <net/if.h>
-#include <pthread.h>
-#include <fcntl.h>
 
 #include "parasite.h"
 
@@ -43,8 +47,10 @@
 #define MAX_THREADS		1024
 #define MSS			1400
 
-static const char *setup_nfqueue_cmd = "./setup-nfqueue";
-static const char *flush_nfqueue_cmd = "./flush-nfqueue";
+static const char setup_pnfq_cmd_base[] = "setup-nfqueue";
+static const char flush_pnfq_cmd_base[] = "flush-nfqueue";
+static char setup_pnfq_cmd[PATH_MAX];
+static char flush_pnfq_cmd[PATH_MAX];
 
 static pid_t tids[MAX_THREADS];
 static int nr_threads;
@@ -59,9 +65,8 @@ static int remote_sock;
 static char pnfq_buf[4096] __attribute__((aligned));
 
 enum {
-	PNFQ_WAIT_SYN,
-	PNFQ_WAIT_ACK,
-	PNFQ_DRAIN,
+	PNFQ_WAIT_SYN,		/* wait SYN from local */
+	PNFQ_WAIT_ACK,		/* wait ACK of certain seq from local */
 };
 
 static int pnfq_cmd;
@@ -101,7 +106,7 @@ static void setup_pnfq(void)
 	       inet_ntop(AF_INET, &rin, rstr, sizeof(rstr)), ntohs(si->remote_port),
 	       si->in_qsz, si->in_seq, si->out_qsz, si->out_seq);
 
-	snprintf(buf, sizeof(buf), "%s %s:%d %s:%d", setup_nfqueue_cmd,
+	snprintf(buf, sizeof(buf), "%s %s:%d %s:%d", setup_pnfq_cmd,
 		 inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
 		 inet_ntop(AF_INET, &rin, rstr, sizeof(rstr)), ntohs(si->remote_port));
 	assert(!system(buf));
@@ -109,7 +114,7 @@ static void setup_pnfq(void)
 
 static void flush_pnfq(void)
 {
-	assert(!system(flush_nfqueue_cmd));
+	assert(!system(flush_pnfq_cmd));
 }
 
 /*
@@ -345,6 +350,10 @@ retry:
 	return uregs.rax;
 }
 
+/*
+ * Tell the pararsite to execute a PCMD_* command, wait for completion, and
+ * record and return the response.
+ */
 static long parasite_cmd(int sock, int opcode,
 			 unsigned long arg0, unsigned long arg1,
 			 void *data, unsigned long *data_len)
@@ -384,24 +393,35 @@ static void parasite_sequencer(void)
 	assert((pcmd_sock = accept(listen_sock, NULL, NULL)) >= 0);
 	printf(" connected\n");
 
+	/* let's see whether it works */
 	data_len = sizeof(hello);
 	assert(!parasite_cmd(pcmd_sock, PCMD_SAY, 0, 0,
 			     (void *)hello, &data_len));
 
+	/* if connection hijacking wasn't requested, nothing more to do */
 	if (target_sock_fd < 0)
 		goto exit;
 
+	/*
+	 * Acquire socket info and setup nfqueue such that packets
+	 * belonging to the connection is sent to pnfq.
+	 */
 	len = 0;
 	assert(!parasite_cmd(pcmd_sock, PCMD_SOCKINFO,
 			     target_sock_fd, 0, si, &len));
-
 	setup_pnfq();
 
+	/*
+	 * Acquire socket info again.  TCP sequence numbers need to be
+	 * sampled after blocking packets, so we need to do this again
+	 * after setup_pnfq().
+	 */
 	len = 0;
 	assert(!parasite_cmd(pcmd_sock, PCMD_SOCKINFO,
 			     target_sock_fd, 0, si, &len));
 	assert(si->in_qsz <= PCMD_MAX_DATA && si->out_qsz <= PCMD_MAX_DATA);
 
+	/* peek and save rx and tx queues */
 	if (si->in_qsz) {
 		assert((in_buf = malloc(si->in_qsz)));
 		data_len = 0;
@@ -420,6 +440,11 @@ static void parasite_sequencer(void)
 	}
 	printf("peeked socket buffer in %d out %d\n", si->in_qsz, si->out_qsz);
 
+	/*
+	 * We have all information we need to hijack the connection.  Tell
+	 * the parasite to replace the fd with the command socket which
+	 * will act as proxy.
+	 */
 	assert(parasite_cmd(pcmd_sock, PCMD_DUP_CSOCK,
 			    target_sock_fd, 0, NULL, NULL) >= 0);
 exit:
@@ -542,6 +567,10 @@ static void insert_parasite(pid_t tid)
 	free(saved_code);
 }
 
+/*
+ * nfq callback used to block the target connection and fake connection
+ * sequence while restoring it.
+ */
 static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		   struct nfq_data *nfa, void *data)
 {
@@ -572,6 +601,13 @@ static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 
 	from_local = iph->saddr == psockinfo.local_ip;
 
+	/*
+	 * *grumble* For now, let's assume the remote peer is on another
+	 * machine and we aren't talking through lo and so we can assume
+	 * packets coming from lo are the injected ones from @raw_sock.  If
+	 * xt_owner could do pid or socket ino match, this can be done much
+	 * better.
+	 */
 	via_lo = 0;
 	if (indev) {
 		if_indextoname(indev, ifname);
@@ -579,6 +615,7 @@ static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 			via_lo = 1;
 	}
 
+	/* is this the packet we're told to wait for? */
 	switch (pnfq_cmd) {
 	case PNFQ_WAIT_SYN:
 		done = from_local && tcph->syn;
@@ -590,6 +627,7 @@ static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		break;
 	}
 
+	/* if so, copy it out */
 	if (!waited_pkt_len && done) {
 		memcpy(waited_pkt, pkt, size);
 		waited_pkt_len = size;
@@ -605,9 +643,14 @@ static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	       tcph->fin ? "f" : "_", tcph->rst ? "r" : "_",
 	       indev ? ifname : "--", done ? "DONE" : "");
 drop:
+	/* accept packets injected via @raw_sock, drop all others */
 	return nfq_set_verdict(qh, id, via_lo ? NF_ACCEPT : NF_DROP, 0, NULL);
 }
 
+/*
+ * Iterate through packets being queued on nfqueue until the condition
+ * specified by @cmd and @seq is met.  Read comments on PNFQ_* enums.
+ */
 static int pnfq_wait_pkt(int cmd, uint32_t seq)
 {
 	int fd = nfq_fd(pnfq_h);
@@ -618,8 +661,7 @@ static int pnfq_wait_pkt(int cmd, uint32_t seq)
 	waited_pkt_len = 0;
 
 	do {
-		ret = recv(fd, pnfq_buf, sizeof(pnfq_buf),
-			   cmd == PNFQ_DRAIN ? MSG_DONTWAIT : 0);
+		ret = recv(fd, pnfq_buf, sizeof(pnfq_buf), 0);
 		if (ret < 0 && errno == EAGAIN)
 			break;
 		assert(ret > 0);
@@ -658,6 +700,16 @@ uint16_t tcp_csum(uint32_t saddr, uint32_t daddr, void *data, int len)
 	return htons(sum);
 }
 
+/*
+ * Connection information was gleaned from the target socket which is dead
+ * now, and pnfq is still blocking all traffic from the connection.  Try to
+ * re-establish the connection.
+ *
+ * Fake connection works by intercepting outging packets with nfqueue and
+ * injecting packets using a raw socket.  It currently doesn't handle
+ * timeout or retries.  We'll probably need a retry/timeout wrapper around
+ * sendto()/pnfq_wait_pkt() pairs.
+ */
 static void restore_connection(void)
 {
 	struct psockinfo *si = &psockinfo;
@@ -677,6 +729,13 @@ static void restore_connection(void)
 
 	printf("restoring connection, connecting...\n");
 
+	/*
+	 * Send out connection request w/ the matching sequence number.  It
+	 * probably would be better to do this in the other direction -
+	 * ie. accept() here and inject SYN via raw socket to restore 1-N
+	 * port mappings.  Eh well, that shouldn't be too different from
+	 * this anyway.
+	 */
 	assert((sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) >= 0);
 	assert(!bind(sock, (struct sockaddr *)&lsin, sizeof(lsin)));
 	assert(!ioctl(sock, SIOCSOUTSEQ, &lseq));
@@ -686,6 +745,20 @@ static void restore_connection(void)
 
 	pnfq_wait_pkt(PNFQ_WAIT_SYN, 0);
 
+	/*
+	 * Got SYN on pnfq, fake SYN/ACK.  We construct the SYN/ACK packet
+	 * by simply copying the SYN packet and modifying necessary parts,
+	 * which of course isn't correct.  We need to record more
+	 * information from the original socket and advertise the correct
+	 * options.
+	 *
+	 * Another weird thing below is blowing up tcph->window.  This is
+	 * done so that the new socket sends out all the packets when the
+	 * send queue is restored so that the socket considers all of them
+	 * in flight and accepts acks for them.  This works but I'm not
+	 * sure whether this is a guaranteed behavior.  Maybe having a way
+	 * to adjust snd_una is better?
+	 */
 	printf("got SYN, replying with SYN/ACK\n");
 
 	iph = waited_iph;
@@ -708,10 +781,22 @@ static void restore_connection(void)
 		      (struct sockaddr *)&lsin, sizeof(lsin)) == ntohs(iph->tot_len));
 	rseq++;
 
+	/* save the headers for later data packets */
 	memcpy(data_pkt, iph, hlen);
 
 	pnfq_wait_pkt(PNFQ_WAIT_ACK, rseq);
 
+	/*
+	 * Connection is established.  Let's restore rx/tx queues.  rx
+	 * queue is restored by feeding data packets to the socket.  tx is
+	 * simpler, we just write to the socket.
+	 *
+	 * For both directions, we need to make sure snd/rcvbuf are large
+	 * enough for restoration.  SO_RCV/SNDBUFFORCE achieve this but it
+	 * would nice if there's a way to tell the kernel that it can
+	 * return to normal queue sizing behavior afterwards - ie. turn off
+	 * SOCK_RCV/SNDBUF_LOCK.
+	 */
 	printf("connection established, repopulating rx/tx queues\n");
 
 	v = si->in_qsz;
@@ -734,7 +819,6 @@ static void restore_connection(void)
 		tcph->check = 0;
 		tcph->check = tcp_csum(iph->saddr, iph->daddr, tcph,
 				       sizeof(*tcph) + sz);
-
 		xfer += sz;
 		rseq += sz;
 
@@ -747,14 +831,22 @@ static void restore_connection(void)
 	assert(!setsockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, &v, sizeof(v)));
 	assert(send(sock, out_buf, si->out_qsz, 0) == si->out_qsz);
 
+	/*
+	 * Alright, the new socket should be ready now, hopefully.  Let's
+	 * drop the barrier and watch the fireworks.
+	 */
 	printf("connection restored\n");
-
 	flush_pnfq();
 
+	/* turn off O_NONBLOCK for later data redirection accesses */
 	assert(!fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) & ~O_NONBLOCK));
 	remote_sock = sock;
 }
 
+/*
+ * Function for data redirection threads.  Nothing fancy.  Read from one
+ * side and pass it over to the other.
+ */
 static void *forward_thread_fn(void *arg)
 {
 	int dir = (long)arg;
@@ -786,7 +878,7 @@ int main(int argc, char **argv)
 				   .sin_port = 0, };
 	pid_t pid, tid;
 	socklen_t len;
-	int i, v;
+	int i, ret, v;
 	pthread_t pth[2];
 
 	if (argc < 2) {
@@ -796,6 +888,12 @@ int main(int argc, char **argv)
 	pid = strtoul(argv[1], NULL, 0);
 
 	if (argc >= 3) {
+		char path_buf[PATH_MAX], *dir;
+
+		/*
+		 * User requested TCP connection hijacking.  Set up pnfq,
+		 * raw socket and construct paths for pnfq scripts.
+		 */
 		target_sock_fd = strtoul(argv[2], NULL, 0);
 		assert((pnfq_h = nfq_open()));
 		nfq_unbind_pf(pnfq_h, AF_INET);
@@ -805,11 +903,21 @@ int main(int argc, char **argv)
 		assert((raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)) >= 0);
 		v = 1;
 		assert(!setsockopt(raw_sock, IPPROTO_IP, IP_HDRINCL, &v, sizeof(int)));
+
+		/* assume scripts are in the same directory as this binary */
+		ret = readlink("/proc/self/exe", path_buf, sizeof(path_buf));
+		assert(ret >= 0 && ret < sizeof(path_buf) - 1);
+		path_buf[ret] = '\0';
+
+		assert(ret >= 0 && ret < PATH_MAX - sizeof(setup_pnfq_cmd_base));
+		setup_pnfq_cmd[ret] = '\0';
+		dir = dirname(path_buf);
+
+		snprintf(setup_pnfq_cmd, sizeof(setup_pnfq_cmd),
+			 "%s/%s", dir, setup_pnfq_cmd_base);
+		snprintf(flush_pnfq_cmd, sizeof(flush_pnfq_cmd),
+			 "%s/%s", dir, flush_pnfq_cmd_base);
 	}
-	if (argc >= 4)
-		setup_nfqueue_cmd = argv[3];
-	if (argc >= 5)
-		flush_nfqueue_cmd = argv[4];
 
 	/* verify signature at port offset in parasite blob */
 	memcpy(&v, parasite_blob + PCMD_PORT_OFFSET, sizeof(v));
@@ -833,9 +941,11 @@ int main(int argc, char **argv)
 
 	insert_parasite(tid);
 
+	/* parasite is done, detach from target process */
 	for (i = 0; i < nr_threads; i++)
 		assert(!ptrace(PTRACE_DETACH, tids[i], NULL, NULL));
 
+	/* if TCP connection hijacking wasn't requested nothing more to do */
 	if (target_sock_fd < 0)
 		return 0;
 
@@ -848,7 +958,6 @@ int main(int argc, char **argv)
 	/* forward the data */
 	assert(!pthread_create(&pth[0], NULL, forward_thread_fn, (void *)(long)0));
 	assert(!pthread_create(&pth[1], NULL, forward_thread_fn, (void *)(long)1));
-
 	assert(!pthread_join(pth[0], NULL));
 	assert(!pthread_join(pth[1], NULL));
 
