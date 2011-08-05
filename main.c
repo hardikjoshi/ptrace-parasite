@@ -1,3 +1,4 @@
+/* GPLv2, read README for info */
 #define _GNU_SOURCE
 
 #include <sys/ioctl.h>

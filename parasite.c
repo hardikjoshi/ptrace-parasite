@@ -1,3 +1,4 @@
+/* GPLv2, read README for info */
 #include <inttypes.h>
 #include <errno.h>
 #include <sys/ioctl.h>
