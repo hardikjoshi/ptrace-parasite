@@ -41,7 +41,11 @@
 
 #define PTRACE_EVENT_STOP	7
 
-#define SIOCSOUTSEQ		0x894E
+#define SIOCGINSEQ	0x89b1		/* get copied_seq */
+#define SIOCGOUTSEQS	0x89b2		/* get seqs for pending tx pkts */
+#define SIOCSOUTSEQ	0x89b3		/* set write_seq */
+#define SIOCPEEKOUTQ	0x89b4		/* peek output queue */
+#define SIOCFORCEOUTBD	0x89b5		/* force output packet boundary */
 
 /* params pulled out of my ass */
 #define MAX_THREADS		1024
@@ -376,7 +380,7 @@ static void setup_pnfq(void)
 	printf("target socket: %s:%d -> %s:%d in %u@%#08x out %u@%#08x\n",
 	       inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
 	       inet_ntop(AF_INET, &rin, rstr, sizeof(rstr)), ntohs(si->remote_port),
-	       si->in_qsz, si->in_seq, si->out_qsz, si->out_seq);
+	       si->in_qsz, si->in_seq, si->out_qsz, si->out_seqs[0]);
 
 	snprintf(buf, sizeof(buf), "%s %s:%d %s:%d", setup_pnfq_cmd,
 		 inet_ntop(AF_INET, &lin, lstr, sizeof(lstr)), ntohs(si->local_port),
@@ -645,12 +649,14 @@ static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	} else
 		done = 0;
 
-	printf("pkt: %s S %08x A %08x %s%s%s%s via %s %s\n",
+	printf("pkt: %s S %08x A %08x D %05u %s%s%s%s via %s%s%s\n",
 	       from_local ? "L->R" : "R->L",
 	       ntohl(tcph->seq), ntohl(tcph->ack_seq),
+	       ntohs(iph->tot_len) - (iph->ihl + tcph->doff) * 4,
 	       tcph->ack ? "a" : "_", tcph->syn ? "s" : "_", 
 	       tcph->fin ? "f" : "_", tcph->rst ? "r" : "_",
-	       indev ? ifname : "--", done ? "DONE" : "");
+	       indev ? ifname : "--", via_lo ? " ACPT" : " DROP",
+	       done ? " DONE" : "");
 drop:
 	/* accept packets injected via @raw_sock, drop all others */
 	return nfq_set_verdict(qh, id, via_lo ? NF_ACCEPT : NF_DROP, 0, NULL);
@@ -728,13 +734,14 @@ static void restore_connection(void)
 	struct sockaddr_in rsin = { .sin_family = AF_INET,
 				    .sin_addr.s_addr = si->remote_ip,
 				    .sin_port = si->remote_port, };
-	uint32_t lseq = si->out_seq - si->out_qsz - 1;	/* -1 for SYN */
-	uint32_t rseq = si->in_seq - 1;			/* ditto */
+	uint32_t lseq = si->out_seqs[0] - si->out_qsz - 1;	/* -1 for SYN */
+	uint32_t rseq = si->in_seq - 1;				/* ditto */
+	uint32_t seq;
 	uint8_t data_pkt[4096];
 	struct iphdr *iph;
 	struct tcphdr *tcph;
 	const int hlen = sizeof(*iph) + sizeof(*tcph);
-	int sock, xfer, v;
+	int sock, xfer, i, v;
 
 	printf("restoring connection, connecting...\n");
 
@@ -766,7 +773,7 @@ static void restore_connection(void)
 	 * send queue is restored so that the socket considers all of them
 	 * in flight and accepts acks for them.  This works but I'm not
 	 * sure whether this is a guaranteed behavior.  Maybe having a way
-	 * to adjust snd_una is better?
+	 * to adjust tp->snd_nxt is better?
 	 */
 	printf("got SYN, replying with SYN/ACK\n");
 
@@ -796,20 +803,20 @@ static void restore_connection(void)
 	pnfq_wait_pkt(PNFQ_WAIT_ACK, rseq);
 
 	/*
-	 * Connection is established.  Let's restore rx/tx queues.  rx
-	 * queue is restored by feeding data packets to the socket.  tx is
-	 * simpler, we just write to the socket.
-	 *
-	 * For both directions, we need to make sure snd/rcvbuf are large
-	 * enough for restoration.  SO_RCV/SNDBUFFORCE achieve this but it
-	 * would nice if there's a way to tell the kernel that it can
-	 * return to normal queue sizing behavior afterwards - ie. turn off
-	 * SOCK_RCV/SNDBUF_LOCK.
+	 * Ensure rcv and snd bufs are large enough for restoration.
+	 * SO_RCV/SNDUFFORCE achieve this but it would nice if there's a
+	 * way to tell the kernel that it can return to normal queue sizing
+	 * behavior afterwards - ie. turn off SOCK_RCVSNDBUF_LOCK.
 	 */
-	printf("connection established, repopulating rx/tx queues\n");
-
 	v = si->in_qsz;
 	assert(!setsockopt(sock, SOL_SOCKET, SO_RCVBUFFORCE, &v, sizeof(v)));
+	v = si->out_qsz;
+	assert(!setsockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, &v, sizeof(v)));
+
+	/*
+	 * Let's restore rx queue by feeding data packets to the socket.
+	 */
+	printf("connection established, repopulating rx/tx queues\n");
 
 	iph = (void *)data_pkt;
 	tcph = (void *)data_pkt + sizeof(*iph);
@@ -836,9 +843,27 @@ static void restore_connection(void)
 		pnfq_wait_pkt(PNFQ_WAIT_ACK, rseq);
 	}
 
-	v = si->out_qsz;
-	assert(!setsockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, &v, sizeof(v)));
-	assert(send(sock, out_buf, si->out_qsz, 0) == si->out_qsz);
+	/*
+	 * Now to tx queue.  We need to preserve the original packet
+	 * boundaries to make make receiving ack and retransmission work.
+	 * e.g. if some acks were in flight when the connection was
+	 * hijacked and restoration results in different packet boundaries,
+	 * ack may end up pointing to middle of a packet and our
+	 * retransmissions may fall across the sequence the remote side is
+	 * expecting.
+	 *
+	 * si->out_seqs[] has all the sequence numbers we need.  Force
+	 * packet separation by SIOCFORCEOUTBD and send in the same sizes.
+	 */
+	seq = lseq;
+	for (i = si->nr_out_seqs - 1; i >= 0; i--) {
+		int off = seq - lseq;
+		int sz = si->out_seqs[i] - seq;
+
+		assert(!ioctl(sock, SIOCFORCEOUTBD));
+		assert(send(sock, out_buf + off, sz, 0) == sz);
+		seq += sz;
+	}
 
 	/*
 	 * Alright, the new socket should be ready now, hopefully.  Let's

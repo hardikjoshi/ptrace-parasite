@@ -118,10 +118,11 @@ static long __used syscall6(int nr, unsigned long arg0, unsigned long arg1,
 #define __NR_gettid		186
 #define __NR_time		201
 
-#define SIOCGINSEQ	0x894C		/* get copied_seq */
-#define SIOCGOUTSEQ	0x894D		/* get write_seq */
-#define SIOCSOUTSEQ	0x894E		/* set write_seq */
-#define SIOCPEEKOUTQ	0x894F		/* peek output queue */
+#define SIOCGINSEQ	0x89b1		/* get copied_seq */
+#define SIOCGOUTSEQS	0x89b2		/* get seqs for pending tx pkts */
+#define SIOCSOUTSEQ	0x89b3		/* set write_seq */
+#define SIOCPEEKOUTQ	0x89b4		/* peek output queue */
+#define SIOCFORCEOUTBD	0x89b5		/* force output packet boundary */
 
 static ssize_t __used sys_write(int fd, const void *buf, size_t count)
 {

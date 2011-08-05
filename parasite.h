@@ -22,15 +22,18 @@ enum {
 	PCMD_DUP_CSOCK,		/* @arg0 is fd to dup over w/ cmd socket */
 };
 
+#define PSOCKINFO_MAX_SEQS	1024
+
 struct psockinfo {
 	uint32_t	local_ip;
 	uint32_t	remote_ip;
 	uint16_t	local_port;
 	uint16_t	remote_port;
-	uint32_t	in_seq;
-	uint32_t	out_seq;
 	uint32_t	in_qsz;
 	uint32_t	out_qsz;
+	uint32_t	in_seq;
+	uint32_t	nr_out_seqs;
+	uint32_t	out_seqs[PSOCKINFO_MAX_SEQS];
 };
 
 #endif

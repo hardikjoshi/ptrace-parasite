@@ -17,7 +17,11 @@
 #include <endian.h>
 #include <linux/sockios.h>
 
-#define SIOCPEEKOUTQ	0x894F		/* peek output queue */
+#define SIOCGINSEQ	0x89b1		/* get copied_seq */
+#define SIOCGOUTSEQS	0x89b2		/* get seqs for pending tx pkts */
+#define SIOCSOUTSEQ	0x89b3		/* set write_seq */
+#define SIOCPEEKOUTQ	0x89b4		/* peek output queue */
+#define SIOCFORCEOUTBD	0x89b5		/* force output packet boundary */
 
 static const struct timespec ts1ms = { .tv_nsec = 1000000 };
 static uint64_t contaminant = 0;
@@ -34,10 +38,20 @@ static void sigaction_handler(int signo, siginfo_t *si, void *uctx)
 
 static void peek_outq(int sock, uint64_t cur)
 {
+	uint32_t seq_buf[1024];
 	int size, ret;
 	char *buf, *p;
-	int nr_contaminants = 0;
+	int i, nr_contaminants = 0;
 	uint64_t val;
+
+	seq_buf[0] = sizeof(seq_buf);
+	assert((ret = ioctl(sock, SIOCGOUTSEQS, seq_buf)) >= 0);
+	ret = ret <= sizeof(seq_buf) ? ret : sizeof(seq_buf);
+
+	printf("SIOCGOUTSEQS:");
+	for (i = 0; i < ret / sizeof(uint32_t); i++)
+		printf(" %08x", seq_buf[i]);
+	printf("\n");
 
 	assert(!(ioctl(sock, SIOCOUTQ, &size)));
 	buf = malloc(size);
@@ -54,7 +68,7 @@ static void peek_outq(int sock, uint64_t cur)
 	printf("peek_outq %d bytes: ", ret);
 	cur--;
 
-	printf("[%#08llx", (unsigned long long)cur);
+	printf("[%08llx", (unsigned long long)cur);
 
 	for (p = buf + ret - sizeof(val); p > buf; p -= sizeof(val)) {
 		memcpy(&val, p, sizeof(val));
@@ -63,12 +77,12 @@ static void peek_outq(int sock, uint64_t cur)
 		if (val == cur) {
 			cur--;
 		} else {
-			printf(" #%#08llx", (unsigned long long)cur + 1);
+			printf(" #%08llx", (unsigned long long)cur + 1);
 			nr_contaminants++;
 		}
 	}
 
-	printf(" %#08llx]", (unsigned long long)cur + 1);
+	printf(" %08llx]", (unsigned long long)cur + 1);
 	printf(" nr_contaminants=%d\n", nr_contaminants);
 }
 

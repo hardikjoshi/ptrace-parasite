@@ -76,14 +76,6 @@ static int get_sockinfo(int fd, struct psockinfo *si)
 	si->remote_ip = sin.sin_addr.s_addr;
 	si->remote_port = sin.sin_port;
 
-	emsg = "SIOCGINSEQ";
-	if ((ret = sys_ioctl(fd, SIOCGINSEQ, &si->in_seq)))
-		goto out;
-
-	emsg = "SIOCGOUTSEQ";
-	if ((ret = sys_ioctl(fd, SIOCGOUTSEQ, &si->out_seq)))
-		goto out;
-
 	emsg = "SIOCINQ";
 	if ((ret = sys_ioctl(fd, SIOCINQ, &si->in_qsz)))
 		goto out;
@@ -91,6 +83,20 @@ static int get_sockinfo(int fd, struct psockinfo *si)
 	emsg = "SIOCOUTQ";
 	if ((ret = sys_ioctl(fd, SIOCOUTQ, &si->out_qsz)))
 		goto out;
+
+	emsg = "SIOCGINSEQ";
+	if ((ret = sys_ioctl(fd, SIOCGINSEQ, &si->in_seq)))
+		goto out;
+
+	emsg = "SIOCGOUTSEQS";
+	si->out_seqs[0] = sizeof(si->out_seqs);
+	ret = sys_ioctl(fd, SIOCGOUTSEQS, si->out_seqs);
+	if (ret > sizeof(si->out_seqs))
+		ret = -EOVERFLOW;
+	if (ret < 0)
+		goto out;
+	si->nr_out_seqs = ret / sizeof(uint32_t);
+	ret = 0;
 out:
 	if (ret < 0) {
 		print_msg("PARASITE get_sockinfo failed: ");
