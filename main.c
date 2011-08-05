@@ -79,6 +79,7 @@ static char pnfq_buf[4096] __attribute__((aligned));
 enum {
 	PNFQ_WAIT_SYN,		/* wait SYN from local */
 	PNFQ_WAIT_ACK,		/* wait ACK of certain seq from local */
+	PNFQ_WAIT_PASS,		/* pass queued packets through */
 };
 
 /* for pnfq packet diddling */
@@ -589,11 +590,12 @@ static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 {
 	uint32_t id = 0, done = 0;
 	int indev = nfq_get_indev(nfa);
+	int verdict = NF_DROP;
 	unsigned char *pkt;
 	struct iphdr *iph;
 	struct tcphdr *tcph;
 	struct nfqnl_msg_packet_hdr *ph;
-	int from_local, via_lo, size;
+	int from_local, size;
 	char ifname[IFNAMSIZ] = "";
 
 	if ((ph = nfq_get_msg_packet_hdr(nfa)))
@@ -621,11 +623,10 @@ static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	 * xt_owner could do pid or socket ino match, this can be done much
 	 * better.
 	 */
-	via_lo = 0;
 	if (indev) {
 		if_indextoname(indev, ifname);
 		if (ifname[0] == 'l' && ifname[1] == 'o')
-			via_lo = 1;
+			verdict = NF_ACCEPT;
 	}
 
 	/* is this the packet we're told to wait for? */
@@ -638,6 +639,9 @@ static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		done = from_local && tcph->ack &&
 			ntohl(tcph->ack_seq) == pnfq_wait_ack_seq;
 		break;
+	case PNFQ_WAIT_PASS:
+		verdict = NF_ACCEPT;
+		break;
 	}
 
 	/* if so, copy it out */
@@ -649,17 +653,15 @@ static int pnfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	} else
 		done = 0;
 
-	printf("pkt: %s S %08x A %08x D %05u %s%s%s%s via %s%s%s\n",
+	printf("pkt: %s S %08x A %08x D %05u %s%s%s%s %s%s\n",
 	       from_local ? "L->R" : "R->L",
 	       ntohl(tcph->seq), ntohl(tcph->ack_seq),
 	       ntohs(iph->tot_len) - (iph->ihl + tcph->doff) * 4,
 	       tcph->ack ? "a" : "_", tcph->syn ? "s" : "_", 
 	       tcph->fin ? "f" : "_", tcph->rst ? "r" : "_",
-	       indev ? ifname : "--", via_lo ? " ACPT" : " DROP",
-	       done ? " DONE" : "");
+	       verdict == NF_ACCEPT ? "ACPT" : "DROP", done ? " DONE" : "");
 drop:
-	/* accept packets injected via @raw_sock, drop all others */
-	return nfq_set_verdict(qh, id, via_lo ? NF_ACCEPT : NF_DROP, 0, NULL);
+	return nfq_set_verdict(qh, id, verdict, 0, NULL);
 }
 
 /*
@@ -676,7 +678,8 @@ static int pnfq_wait_pkt(int cmd, uint32_t seq)
 	waited_pkt_len = 0;
 
 	do {
-		ret = recv(fd, pnfq_buf, sizeof(pnfq_buf), 0);
+		ret = recv(fd, pnfq_buf, sizeof(pnfq_buf),
+			   cmd == PNFQ_WAIT_PASS ? MSG_DONTWAIT : 0);
 		if (ret < 0 && errno == EAGAIN)
 			break;
 		assert(ret > 0);
@@ -808,9 +811,9 @@ static void restore_connection(void)
 	 * way to tell the kernel that it can return to normal queue sizing
 	 * behavior afterwards - ie. turn off SOCK_RCVSNDBUF_LOCK.
 	 */
-	v = si->in_qsz;
+	v = 2 * si->in_qsz;
 	assert(!setsockopt(sock, SOL_SOCKET, SO_RCVBUFFORCE, &v, sizeof(v)));
-	v = si->out_qsz;
+	v = 2 * si->out_qsz + 1024;
 	assert(!setsockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, &v, sizeof(v)));
 
 	/*
@@ -861,15 +864,18 @@ static void restore_connection(void)
 		int sz = si->out_seqs[i] - seq;
 
 		assert(!ioctl(sock, SIOCFORCEOUTBD));
+		printf("snd: ---- S %08x A -------- D %05u\n", seq, sz);
 		assert(send(sock, out_buf + off, sz, 0) == sz);
 		seq += sz;
 	}
 
 	/*
 	 * Alright, the new socket should be ready now, hopefully.  Let's
-	 * drop the barrier and watch the fireworks.
+	 * drop the barrier and watch the fireworks.  At this point, all
+	 * packets which could be on pnfq are valid.  Pass them through.
 	 */
 	printf("connection restored\n");
+	pnfq_wait_pkt(PNFQ_WAIT_PASS, 0);
 	flush_pnfq();
 
 	/* turn off O_NONBLOCK for later data redirection accesses */
