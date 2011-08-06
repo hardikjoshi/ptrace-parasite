@@ -1,0 +1,539 @@
+
+Parasite thread injection and TCP connection hijacking example code
+===================================================================
+
+This example code is for linux >= 3.1-rc1 on x86_64.
+
+The goal is to demonstrate the followings.
+
+* Transparent injection of a thread into the target process using new
+  ptrace commands - PTRACE_SEIZE and INTERRUPT.
+
+* Using the injected thread to capture a TCP connection and restoring
+  it in another process.
+
+Both are primarily to serve as the start point for mostly userland
+checkpoint-restart implementation.  The latter is likely to be of
+interest to virtual server farms and high availability too.
+
+The code contained here is by no means ready for production.  It's
+more of proof-of-concept; however, I'll try to document the missing
+pieces here and in the comments.
+
+
+Organization
+============
+
+The following files are for the executable 'parasite'.
+
+ main.c		The bulk of the example program which seizes target
+		process, inject parasite and sequence it to hijack TCP
+		connection.
+
+ parasite.c	Self contained code which is compiled as PIC and
+		injected into target process.  Parasite thread
+		executes this code.
+
+ parasite.h	Included by both main.c and parasite.c.  Defines
+		protocol used between the main program and injected
+		parasite thread.
+
+ syscall.h	Syscall interface used by parasite.c.
+
+ setup-nfqueue	Helper script to setup iptables rules to send packets
+		for a specified connection to nfqueue.  Don't mix with
+		working firewall setup.  Invoked by the executable
+		while hijacking TCP connection and assumed to be in
+		the same directory.
+
+ flush-nfqueue	Naive script to reverse setup-nfqueue.  It just clears
+		INPUT and OUTPUT tables.  Again, don't mix with
+		working firewall setup.  Invoked by the executable
+		while hijacking TCP connection and assumed to be in
+		the same directory.
+
+Build procedure is a bit unusual.  parasite.c is compiled as PIC,
+linked into raw binary parasite.bin using parasite.lds and hexdumped
+into C array 'char parasite_blob[]' in parasite-blob.h.  main.c
+includes this file and the final executable embeds the parasite blob
+in it.
+
+The followings are example programs to serve as host to inject
+parasite into.
+
+ simple-host.c	Simple pthread program.  Five threads print out
+		heartbeat messages each second.  Has simple SIGUSR1/2
+		handler for signal testing.
+
+ net-host.c	TCP connection test program.  Depending on parameter,
+		it either listens for connection or connects as
+		directed.  Once connection is established, both
+		parties keep sending incrementing uint64_t and verify
+		that received data is incrementing uint64_t's.
+
+		Has bandwidth throttling on the receiver side.  This
+		ensures that both local rx and remote tx queues are
+		populated.
+
+		SIGUSR1 injects uint64_t which isn't part of the
+		sequence which will be detected and reported by the
+		remote side.  This can be used for verification and
+		measuring send(2) to recv(2) latency.
+
+		SIGUSR2 tests SIOCGOUTSEQS and SIOCPEEKOUTQ.  Just
+		added to verify kernel features.
+
+tcp-ioctls.patch is a patch to implement extra TCP ioctls for
+connection hijacking.  This will be discussed further later.
+Applicable to kernel 3.1-rc1.
+
+
+Parasite thread injection
+=========================
+
+ptrace provides access to full process memory space and register
+states, so it could always have manipulated the tracee however it
+pleased including making it executing arbitrary code.  Unfortunately,
+the previously existing commands depended on signals to interrupt the
+tracee and interaction with job control was both poorly designed and
+implemented.  This meant that although ptrace could be used to inject
+arbitrary code into tracee, it couldn't do that without affecting
+signal and job control states.
+
+Broken parts of ptrace have been fixed and three new ptrace requests
+are available from kernel 3.1 under development flag (which is
+scheduled to be removed from 3.2) - PTRACE_SEIZE, INTERRUPT and
+LISTEN.  These new requests allow transparent monitoring and
+manipulation of tracee.  Note that transparency is not absolute in the
+sense that ptrace operations would behave as signal delivery attempt
+which can affect execution of certain system calls; however, userland
+is already mandated to handle the condition regardless of ptrace and
+albeit not absolute it still is complete in the scope defined by the
+API.
+
+Once all threads of the target process are seized, tracer can execute
+arbitrary code using the following sequence.
+
+1. PTRACE_SEIZE and INTERRUPT all threads belonging to the target
+   process.  This is implemented in main.c::seize_process().  As noted
+   in the source, the implementation isn't complete.  Proper
+   implementation requires verification and retries in case thread
+   creations and/or destructions race against seizing.
+
+   Once INTERRUPT is issued, tracee either stops at job control trap
+   or in exec path.  If tracee is about to exec, there isn't much to
+   do anyway, so the example code simply aborts in such cases.
+
+   From now on, all operations are assumed to be performed on one of
+   the threads (any thread will do).
+
+2. Decide where to inject the foreign code and save the original code
+   with PTRACE_PEEKDATA.  Tracer can poke any mapped area regardless
+   of protection flags but it can't add execution permission to the
+   code, so it needs to choose memory area which already has X flag
+   set.  The example code uses the page the %rip is in.
+
+   To allow synchronization, the foreign code raises debug trap (int3)
+   after execution finishes.
+
+3. Inject the foreign code using PTRACE_POKEDATA.  The foreign code
+   would usually have to be position independent and self-contained.
+
+   Note that this page will be modified with PTRACE_POKEDATA is likely
+   to trigger COW.  If a process is to be manipulated multiple times,
+   it might be beneficial to use the same page every time.
+
+4. Acquire and save the current register states using PTRACE_GETREGS
+   and modify the register states for execution with PTRACE_SETREGS.
+   Among others, %rip should point to the start address of the
+   injected code and %orig_rax should be set to -1 to avoid
+   end-of-syscall processing while returning to userland (register
+   state will be restored later and end-of-syscall processing should
+   happen after that).
+
+5. Issue PTRACE_CONT to let the tracee return to userland and execute
+   the injected code.  Tracer wait(2)s for tracee to enter stop state.
+   Only two things can happen - signal delivery or end of execution
+   notification via int3.
+
+   Signal delivery either changes job control stop state, kills the
+   process or schedules userland signal handler.  Nothing special to
+   do about the first two.  For userland signal handler scheduling,
+   issuing PTRACE_INTERRUPT before telling tracee to deliver signal
+   with PTRACE_CONT makes tracee to re-trap after userland signal
+   handler is scheduled without actually executing any userland code.
+   Once scheduling is complete, retry from #4.
+
+   After successful execution, tracee would be trapped indicating
+   SIGTRAP delivery.  Squash it and put tracee back into job control
+   trap by first issuing PTRACE_INTERRUPT followed by PTRACE_CONT.
+
+   This step is implemented in execute_blob().
+
+6. Restore saved registers and memory, and PTRACE_DETACH from all
+   threads.
+
+As arbitrary syscall can be issued using injected code, it isn't
+difficult to inject larger chunk of code and create a parasite thread
+on it.  The example code blocks all signals, uses mmap to allocate
+memory, fill it with parasite_blob[], creates the parasite thread
+using clone(2) and let it execute the injected code.
+
+
+EXECUTION EXAMPLE
+
+Running simple-host in a session first and parasite on another yields
+the following outputs.  The alphabets in the first column are
+referenced below to explain what's going on.
+
+  # ./simple-host
+  thread 01(1330): alive
+  thread 02(1331): alive
+  thread 03(1332): alive
+  thread 04(1333): alive
+  thread 00(1329): alive
+A BLOB: hello, world!
+B PARASITE STARTED
+C PARASITE SAY: ah ah! mic test!
+  thread 01(1330): alive
+  thread 02(1331): alive
+  thread 03(1332): alive
+  thread 00(1329): alive
+  ...
+
+  # parasite `pidof simple-host`
+  Seizing 1329
+  Seizing 1330
+  Seizing 1331
+  Seizing 1332
+  Seizing 1333
+A executing test blob
+  blocking all signals = 0, prev_sigmask 0
+  executing mmap blob = 0x7f16f3024000
+  executing clone blob = 1336
+B executing parasite
+C waiting for connection... connected
+  executing munmap blob = 0
+  restoring sigmask = 0, prev_sigmask 0xfffffffffffbfeef
+
+On <A>, simple test code blob which says hi to world is injected into
+the host and executed by one of the host threads to verify blob
+execution works.
+
+A series of blobs are executed afterwards to prepare for thread
+injection.  The parasite thread is created in the host and released
+for execution on <B>.  The first thing it does is printing out STARTED
+message.
+
+After that the injected thread connects back to the main 'parasite'
+program using a TCP connection, at which point it's directed to print
+out mic test message via SAY command.  This is happening on <C>.
+
+After that, the prep steps are reversed and the target process is
+released to continue normal execution.
+
+Job control and USR signals directed at the target process should
+behave as expected (sans the extra latency introduced by parasite) no
+matter when they are generated.
+
+
+TCP connection hijacking
+========================
+
+This part is much less complete and really a proof-of-concept.  The
+goal is to show that TCP connection can be checkpointed in one process
+and restored in another with only small additions to the networking
+stack.  This also demonstrates that, with parasite threads, most
+information is already available to checkpointer and adding mechanisms
+to extract and manipulate more states can be done in very
+non-obtrusive manner by extending existing API.  There's no new
+security, locking or visibility boundary issues.
+
+Note that CR in many cases wouldn't need this transparent snapshotting
+of TCP connections.  For example, when CRing whole distributed HPC
+workload, there's no reason to maintain TCP details which aren't
+visible to applications at all.  Checkpointing threads injected to
+both ends can simply drain the connection using recv(2) and restore
+them by opening a new connection and repopulating the send buffer on
+the other side with send(2).  DMTCP already uses this method to CR TCP
+connections.
+
+In general, unless the target connection is going to be terminated
+from the target process and restored somewhere else immediately
+(connection migration), there is little point in saving and restoring
+TCP details including send and receive buffers as they become invalid
+as soon as the target process exchanges further packets with the peer
+after the checkpointing, and, if the peer is being checkpointed
+together, draining and repopulating from each end point as described
+above is far better and simpler.
+
+With the above said, the basic states of a TCP connection can be
+checkpointed and restarted with the following extra ioctls.  Note that
+these ioctls should be considered as proof-of-concept.
+
+ SIOCGINSEQ	Determine TCP sequence to be read on the next
+		recv(2) - ie. tp->copied_seq.
+
+ SIOCGOUTSEQS	Determine TCP sequences scheduled for transmission in
+		reverse order.  ie. If the seq after SYN was 6, and
+		20, 30 and 40 byte packets are in the tx queue without
+		receiving any ack, it would return 96, 56, 26 and 6.
+
+ SIOCSOUTSEQ	Set initial TCP sequence to use when establishing a
+		connection.  Only valid on a not-yet-connected or
+		listening socket.  The next connection established
+		will start with the specified sequence.
+
+ SIOCPEEKOUTQ	Peek the content of tx queue.
+
+ SIOCFORCEOUTBD	Force packet separation on the next send(2).
+		ie. data from the next send(2) won't be merged into
+		the same packet with currently queued data.
+
+A TCP connection can be snapshotted using the following sequence.
+
+s1. Seize target process and inject a parasite thread.
+
+s2. Acquire basic target socket information - IPs and ports.
+
+s3. Block both incoming and outgoing packets belonging to the
+    connection.
+
+s4. Acquire rx queue information - the sequence number of the next
+    byte to be read and the content of recv buffer.  The former is
+    available through SIOCGINSEQ and the latter with recvmsg(2) w/
+    MSG_PEEK.
+
+s5. Acquire tx queue information - the sequence numbers of all pending
+    packets and the content of send buffer.  The former is available
+    through SIOCGOUTSEQS and the latter SIOCPEEKOUTQ.
+
+None of the above steps has irreversible side effect and the
+connection can be safely resumed.  To restore the connection, the
+following steps can be used.
+
+r1. Packets for the connection are still blocked from s3.  Create a
+    way to intercept those packets and inject packets - nf_queue works
+    for the former and raw socket for the latter.  It should drop all
+    packets other than the ones injected via raw socket.
+
+r2. Create a TCP socket, set outgoing sequence with SIOCSOUTSEQ so
+    that it matches the sequence number at the head of the stored send
+    queue, and initiate connection.
+
+r3. Upon intercepting SYN, inject SYN/ACK with the sequence number
+    matching the head of the stored rx queue.
+
+r4. Upon intercepting ACK reply for SYN/ACK, repopulate the rx queue
+    from the stored copy by injecting data packets and waiting for
+    ACKs.
+
+r5. Repopulate tx queue with send(2) with interleaving SIOCFORCEOUTBD
+    calls to preserve the original packet boundaries.
+
+r6. Connection is ready now.  Let the packets pass through.
+
+The following points are worth mentioning regarding the above
+sequences.
+
+* As long as queue information is acquired after packets are blocked,
+  there's no danger of data loss due to race condition on both rx and
+  tx queues.  If data is received after rx queue is stored, the ack
+  wouldn't reach the peer, so it will be retransmitted.  If ack is
+  received after tx queue is stored, it just has extra data which will
+  be acked and discarded again later.
+
+* Both recv and send buffers need to be blown up before repopulating
+  them with stored data.  SO_RCV/SNDBUFFORCE are used for this which
+  disabled automatic buffer sizing.  It would be nice if there's a way
+  to tell the TCP stack to resume auto resizing afterwards.
+
+* Packet boundaries in tx queue need to be preserved, at least between
+  the tx queue head and tp->snd_nxt.  This is because queue
+  restoration can result in different packet division and if the peer
+  already had received some of the packets before, stream can't be
+  resumed with sequences falling inside existing packets.  Note that
+  having more divisions is fine as long as the original boundaries are
+  still there.
+
+* Another subtlety with tx queue is that the TCP socket needs to
+  think that all packets which were transmitted by the original
+  connection are already transmitted before the packet barrier comes
+  down - ie. its tp->snd_nxt needs to be the same as or after the
+  original tp->snd_nxt; otherwise, it might end up ignoring ACKs
+  stalling the connection.
+
+  This currently is achieved by advertising maximum window on injected
+  response packets so that the TCP socket sends out all queued data
+  immediately.  If this isn't a guaranteed behavior, it would make
+  sense to provide a way to manipulate tp->snd_nxt.
+
+* The above sequence makes the new socket connect(2) but it would be
+  better to reverse the direction to enable restoring server
+  connections with N:1 port mapping.
+
+Note that the implemented example code is incomplete in the following
+aspects.
+
+* No URG handling.  As OOB data can be acquired inline with other
+  data.  Adding a mechanism to export URG offset from the tail of
+  queue should be enough.
+
+* Assumes ESTABLISHED.  Proof-of-concept! I get to be lazy! :P
+
+* Doesn't handle options properly during connection negotiation.  I
+  was being lazy but also at the same time am not a network expert and
+  can't tell which ones should do what.  Needs more trained eyes here.
+
+* Connection faking isn't robust at all.  Again, needs more work and
+  some love from network gurus.
+
+* No IPv6.
+
+
+EXECUTION EXAMPLE
+
+Incomplete as it may be, the example implementation actually works
+rather reliably.  The parasite needs to be run as root as it uses
+SO_RCV/SNDBUFFORCE and executes setup-nfqueue and flush-nfqueue
+scripts which manipulate netfilter tables (don't run it on your
+production machine with working firewall).  Also, it assumes that the
+peer of the target TCP connection is on a remote machine and only
+packets injected via raw socket pass through the loopback device.
+
+Two instances of net-host keep talking to each other on 10.7.7.1 and
+10.7.8.1 verifying received stream is sequence of incrementing
+uint64_t's.  We want to hijack the socket from the net-host instance
+on 10.7.8.1 and splice ourselves inside the connection so that the end
+result looks like the following.
+
+ net-host on 10.7.7.1 <---> parasite on 10.7.8.1 <---> net-host on 10.7.8.1
+
+On 10.7.7.1,
+
+  # ./net-host 9999 1024
+A Connected to 10.7.8.2:40986
+H signal 10 si_code=0
+  inserting contaminant @0x22f682
+G foreign data @0x2a7500 : 0xdeadbeefbeefdead
+
+On 10.7.8.1,
+
+  # ./net-host 10.7.7.1:9999 1024
+A Connected to 10.7.7.1:9999
+  BLOB: hello, world!
+  PARASITE STARTED
+B PARASITE SAY: ah ah! mic test!
+H foreign data @0x22f682 : 0xdeadbeefbeefdead
+G signal 10 si_code=0
+  inserting contaminant @0x2a7500
+
+On a different session on 10.7.8.1,
+
+  # ls -l /proc/`pidof net-host`/fd
+  total 0
+  lrwx------ 1 root root 64 Aug  6 12:45 0 -> /dev/ttyS0
+  lrwx------ 1 root root 64 Aug  6 12:45 1 -> /dev/ttyS0
+  lrwx------ 1 root root 64 Aug  6 12:45 2 -> /dev/ttyS0
+  lrwx------ 1 root root 64 Aug  6 12:45 3 -> socket:[12199]
+A # ./parasite `pidof net-host` 3
+  Seizing 1388
+  Seizing 1389
+  executing test blob
+  blocking all signals = 0, prev_sigmask 0
+  executing mmap blob = 0x7fa1e7caa000
+  executing clone blob = 1397
+  executing parasite
+B waiting for connection... connected
+  target socket: 10.7.8.2:40986 -> 10.7.7.1:9999 in 65392@0x185a3439 out 31856@0xb0e08180
+C peeked socket buffer in 65392 out 26064
+  executing munmap blob = 0
+  restoring sigmask = 0, prev_sigmask 0xfffffffffffbfeef
+D restoring connection, connecting...
+  pkt: R->L S 185b33a9 A b0e02158 D 00000 a___ DROP
+  pkt: R->L S 185b33a9 A b0e02158 D 00000 a___ DROP
+  pkt: L->R S b0e02158 A 185b33a9 D 00000 a__r DROP
+  pkt: L->R S b0e01baf A 00000000 D 00000 _s__ DROP DONE
+  got SYN, replying with SYN/ACK
+  pkt: R->L S 185a3438 A b0e01bb0 D 00000 as__ ACPT
+  pkt: L->R S b0e01bb0 A 185a3439 D 00000 a___ DROP DONE
+  connection established, repopulating rx/tx queues
+E pkt: R->L S 185a3439 A b0e01bb0 D 01360 a___ ACPT
+  pkt: L->R S b0e01bb0 A 185a3989 D 00000 a___ DROP DONE
+  pkt: R->L S 185a3989 A b0e01bb0 D 01360 a___ ACPT
+  pkt: L->R S b0e01bb0 A 185a3ed9 D 00000 a___ DROP DONE
+  ...
+  pkt: R->L S 185b3339 A b0e01bb0 D 00112 a___ ACPT
+  pkt: L->R S b0e01bb0 A 185b33a9 D 00000 a___ DROP DONE
+F snd: ---- S b0e01bb0 A -------- D 00000
+  snd: ---- S b0e01bb0 A -------- D 01448
+  ...
+  snd: ---- S b0e07bd8 A -------- D 01448
+G connection restored
+  pkt: L->R S b0e01bb0 A 185b33a9 D 01448 a___ ACPT
+  pkt: L->R S b0e02158 A 185b33a9 D 01448 a___ ACPT
+  ...
+  pkt: L->R S b0e04e98 A 185b33a9 D 01448 a___ ACPT
+  pkt: R->L S 185b3629 A b0e02158 D 00000 a___ ACPT
+  pkt: R->L S 185b3629 A b0e02700 D 00000 a___ ACPT
+  ...
+  pkt: R->L S 185b3629 A b0e05440 D 00000 a___ ACPT
+
+On yet another session on 10.7.7.1,
+
+H # killall -USR1 net-host
+
+On yet another session on 10.7.8.1,
+
+G # killall -USR1 net-host
+
+<A> Two net-host instances are connected to each other sending and
+    verifying each other's stream.  From /proc the socket fd is
+    determined to be 3 and parasite is executed to hijack the socket.
+
+<B> Upto this point, it's the same as the previous thread injection
+    example.  Parasite thread is injected and test command is
+    executed.
+
+<C> Snapshot steps s3 - s5 are executed and the fd 3 is dupped over by
+    a connection to the main program.  This means on 10.7.8.1, the
+    connection doesn't exist anymore; however, 10.7.7.1 doesn't know
+    this as packets belonging to the connection are being dropped.
+
+<D> Restoration steps r1 - r3 are executed.
+
+<E> rx queue is being repopulated.
+
+<F> tx queue is being repopulated.
+
+<G> Connection restored and the main parasite program now owns the
+    original connection to net-host on 10.7.7.1 and a new connection
+    to net-host on 10.7.8.1.  It pipes data between the two.
+
+<H> Verify data is still flowing by triggering net-host on 10.7.7.1 to
+    insert foreign data in the stream, which is soon received by
+    net-host on 10.7.8.1.
+
+<G> Vice-versa from 10.7.8.1 to 10.7.7.1.
+
+
+NOTES
+
+* As said above, the ioctls are only proof-of-concept.  We'll probably
+  need more information exported and maybe a few more ways to
+  manipulate the states.  As long as the state manipulations stay out
+  of usual stream processing - ie. they only affect connection setup,
+  I don't think the added complexity or maintenance overhead would be
+  noticeable.
+
+* Having socket inode # match in iptables would solve the packet
+  matching problem.  Note that even on a busy system, this connection
+  intervention shouldn't add much overhead.  While not snapshotting,
+  no firewall rule is needed.  During snapshotting, only packets of
+  the target connections are ipqueue'd and ipset can match many
+  connections without much overhead.
+
+* While writing, I had more things I wanted to talk about in this
+  section but apparently forgot them. :( I'll add as they come back.
+
+Thanks.

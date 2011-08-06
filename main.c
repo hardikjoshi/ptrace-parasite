@@ -551,7 +551,6 @@ static void insert_parasite(pid_t tid)
 	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
 	assert(!ptrace(PTRACE_CONT, parasite, NULL, NULL));
 	assert(wait4(parasite, &status, __WALL, NULL) == parasite);
-	printf("stats=%x\n", status);
 	assert(WIFEXITED(status));
 
 	/* parasite is done, munmap parasite_blob area */
