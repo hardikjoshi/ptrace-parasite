@@ -17,8 +17,8 @@ checkpoint-restart implementation.  The latter is likely to be of
 interest to virtual server farms and high availability too.
 
 The code contained here is by no means ready for production.  It's
-more of proof-of-concept; however, I'll try to document the missing
-pieces here and in the comments.
+more of proof-of-concept.  I'll try to document the missing pieces
+here and in the comments.
 
 
 Organization
@@ -131,7 +131,8 @@ arbitrary code using the following sequence.
    with PTRACE_PEEKDATA.  Tracer can poke any mapped area regardless
    of protection flags but it can't add execution permission to the
    code, so it needs to choose memory area which already has X flag
-   set.  The example code uses the page the %rip is in.
+   set.  The example code uses the page the %rip is in.  (Note that
+   this isn't completely reliable.  Please read the NOTES section.)
 
    To allow synchronization, the foreign code raises debug trap (int3)
    after execution finishes.
@@ -536,4 +537,14 @@ NOTES
 * While writing, I had more things I wanted to talk about in this
   section but apparently forgot them. :( I'll add as they come back.
 
-Thanks.
+* Andy Lutomirski <luto@MIT.EDU> pointed out that poking the page %rip
+  is in would fail if %rip was executing inside the vsyscall page.  As
+  discussed above, a proper implementation would probably want to use
+  a fixed position in the memory map anyway - ie. scan /proc/PID/maps
+  and look for the executable page to poke and use the same page each
+  time.
+
+  http://thread.gmane.org/gmane.linux.network/203197
+
+--
+tejun
